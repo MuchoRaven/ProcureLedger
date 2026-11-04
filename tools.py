@@ -13,6 +13,8 @@ Design rules enforced here
   written by a single thread-locked writer and fsync'd on every append.
 * ``_execute_payout`` is PRIVATE. It is not part of the agent allowlist and
   must only ever be called from the application layer after a human approval.
+* ``ingest_invoice`` is app-layer only. It is not part of the agent allowlist;
+  the agent can never create an invoice.
 * Public functions never raise for expected business failures; they return
   ``{"ok": False, "error": "<CODE>", ...}`` so the orchestrator can reason
   about them instead of catching exceptions.
@@ -982,7 +984,7 @@ def request_payout_approval(
                 if vendor.get("status") != "ACTIVE"
                 else "VENDOR_HIGH_RISK"
             )
-            _transition(
+            transition = _transition(
                 invoice_id,
                 STATE_REJECTED,
                 reason=block_reason,
@@ -996,6 +998,7 @@ def request_payout_approval(
                     "vendor_id": vendor_id,
                     "amount": amount,
                     "reason": block_reason,
+                    "transition_ok": transition.get("ok"),
                 },
                 correlation_id,
             )
@@ -1005,7 +1008,11 @@ def request_payout_approval(
                 "tool": tool,
                 "invoice_id": invoice_id,
                 "vendor_id": vendor_id,
-                "status": STATE_REJECTED,
+                "status": (
+                    transition.get("to")
+                    if transition.get("ok")
+                    else invoice.get("status")
+                ),
                 "correlation_id": correlation_id,
             }
 
@@ -1138,6 +1145,136 @@ def log_audit_event(
         "prev_hash": receipt["prev_hash"],
         "correlation_id": correlation_id,
     }
+
+
+# ---------------------------------------------------------------------------
+# App-layer intake - NOT allowlisted, application layer only
+# ---------------------------------------------------------------------------
+
+
+def ingest_invoice(
+    invoice_id: str,
+    vendor_id: str,
+    po_id: str,
+    lines: List[Dict[str, Any]],
+    total: float,
+    correlation_id: str = "",
+) -> Dict[str, Any]:
+    """Create an invoice in ``RECEIVED``. App layer only; NOT allowlisted.
+
+    The agent must never be able to conjure an invoice into existence, so this
+    function is deliberately absent from ``agent.ALLOWED_TOOLS``. It validates
+    the payload, refuses duplicate IDs, checks that the vendor and PO exist and
+    agree with each other, then writes the record and an ``INVOICE_RECEIVED``
+    audit event.
+    """
+    correlation_id = _normalize_correlation_id(correlation_id)
+    tool = "ingest_invoice"
+
+    for name, value in (
+        ("invoice_id", invoice_id),
+        ("vendor_id", vendor_id),
+        ("po_id", po_id),
+    ):
+        if not isinstance(value, str) or not value.strip():
+            return _fail(tool, "INVALID_%s" % name.upper(), correlation_id)
+
+    if isinstance(total, bool) or not isinstance(total, (int, float)):
+        return _fail(tool, "INVALID_TOTAL", correlation_id, total=total)
+
+    if not isinstance(lines, list) or not lines:
+        return _fail(tool, "INVALID_LINES", correlation_id)
+
+    normalized_lines: List[Dict[str, Any]] = []
+    for line in lines:
+        if not isinstance(line, dict):
+            return _fail(tool, "INVALID_LINES", correlation_id)
+
+        sku = line.get("sku")
+        qty = line.get("qty")
+        unit_price = line.get("unit_price")
+
+        if not isinstance(sku, str) or not sku.strip():
+            return _fail(tool, "INVALID_LINE_SKU", correlation_id)
+        if isinstance(qty, bool) or not isinstance(qty, (int, float)):
+            return _fail(tool, "INVALID_LINE_QTY", correlation_id, sku=sku)
+        if isinstance(unit_price, bool) or not isinstance(unit_price, (int, float)):
+            return _fail(tool, "INVALID_LINE_UNIT_PRICE", correlation_id, sku=sku)
+
+        normalized_lines.append(
+            {
+                "sku": sku.strip(),
+                "qty": qty,
+                "unit_price": round(float(unit_price), 2),
+            }
+        )
+
+    invoice_id = invoice_id.strip()
+    vendor_id = vendor_id.strip()
+    po_id = po_id.strip()
+    total = round(float(total), 2)
+
+    with _STATE_LOCK:
+        if invoice_id in _INVOICES:
+            return _fail(
+                tool, "DUPLICATE_INVOICE_ID", correlation_id, invoice_id=invoice_id
+            )
+
+        vendor = _VENDORS.get(vendor_id)
+        if vendor is None:
+            return _fail(tool, "VENDOR_NOT_FOUND", correlation_id, vendor_id=vendor_id)
+
+        po = _POS.get(po_id)
+        if po is None:
+            return _fail(tool, "PO_NOT_FOUND", correlation_id, po_id=po_id)
+
+        if po.get("vendor_id") != vendor_id:
+            return _fail(
+                tool,
+                "VENDOR_PO_MISMATCH",
+                correlation_id,
+                vendor_id=vendor_id,
+                po_id=po_id,
+                po_vendor_id=po.get("vendor_id"),
+            )
+
+        timestamp = _utc_now()
+        invoice: Dict[str, Any] = {
+            "invoice_id": invoice_id,
+            "vendor_id": vendor_id,
+            "po_id": po_id,
+            "currency": po.get("currency"),
+            "lines": normalized_lines,
+            "total": total,
+            "status": STATE_RECEIVED,
+            "created_at": timestamp,
+            "updated_at": timestamp,
+            "state_history": [],
+            "payout_id": None,
+        }
+        _INVOICES[invoice_id] = invoice
+
+        _append_audit(
+            "INVOICE_RECEIVED",
+            {
+                "invoice_id": invoice_id,
+                "vendor_id": vendor_id,
+                "po_id": po_id,
+                "total": total,
+                "currency": invoice["currency"],
+                "line_count": len(normalized_lines),
+            },
+            correlation_id,
+        )
+
+        return {
+            "ok": True,
+            "tool": tool,
+            "invoice_id": invoice_id,
+            "status": STATE_RECEIVED,
+            "invoice": json.loads(json.dumps(invoice, default=str)),
+            "correlation_id": correlation_id,
+        }
 
 
 # ---------------------------------------------------------------------------
