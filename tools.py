@@ -18,16 +18,26 @@ Concurrency
 -----------
 State lives in module globals guarded by ``_LOCK``. Run the server with a
 single worker (``uvicorn ... --workers 1``); the audit chain is process-local.
+
+Persistence
+-----------
+Every audit link is appended to ``config.AUDIT_LOG_PATH`` as one JSON object
+per line and ``fsync``-ed before the tool call returns. ``verify_audit_chain``
+can re-verify either the in-memory chain (default) or the on-disk chain
+(``from_file=True``).
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import os
 import threading
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
+
+import config
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -197,6 +207,33 @@ def _compute_hash(entry: Dict[str, Any]) -> str:
     return hashlib.sha256(_canonical(body).encode("utf-8")).hexdigest()
 
 
+def _persist_audit(entry: Dict[str, Any]) -> None:
+    """Append one audit link to ``config.AUDIT_LOG_PATH`` and fsync it."""
+    path = config.AUDIT_LOG_PATH
+    if not path:
+        return
+    line = json.dumps(entry, sort_keys=True, separators=(",", ":"), default=str)
+    with open(path, "a", encoding="utf-8") as fh:
+        fh.write(line + "\n")
+        fh.flush()
+        os.fsync(fh.fileno())
+
+
+def _load_audit_from_file() -> List[Dict[str, Any]]:
+    """Read the on-disk audit chain. Missing file means empty chain."""
+    path = config.AUDIT_LOG_PATH
+    if not path or not os.path.exists(path):
+        return []
+    entries: List[Dict[str, Any]] = []
+    with open(path, "r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            entries.append(json.loads(line))
+    return entries
+
+
 def _append_audit(
     event_type: str, payload: Dict[str, Any], correlation_id: str = ""
 ) -> Dict[str, Any]:
@@ -215,6 +252,7 @@ def _append_audit(
         }
         entry["hash"] = _compute_hash(entry)
         _AUDIT.append(entry)
+        _persist_audit(entry)
         return entry
 
 
@@ -246,6 +284,10 @@ def _reset_state() -> None:
         for invoice in _INVOICES.values():
             invoice["status"] = "RECEIVED"
             invoice["updated_at"] = invoice["created_at"]
+        path = config.AUDIT_LOG_PATH
+        if path:
+            with open(path, "w", encoding="utf-8"):
+                pass
 
 # ---------------------------------------------------------------------------
 # Allowlisted tools
@@ -497,11 +539,18 @@ def get_approval(approval_id: str, correlation_id: str = "") -> Dict[str, Any]:
         return {"ok": True, "approval": dict(approval)}
 
 
-def verify_audit_chain(correlation_id: str = "") -> Dict[str, Any]:
-    """Recompute the audit hash chain and report the first divergence."""
+def verify_audit_chain(
+    correlation_id: str = "", from_file: bool = False
+) -> Dict[str, Any]:
+    """Recompute the audit hash chain and report the first divergence.
+
+    ``from_file=False`` (default) verifies the in-memory chain.
+    ``from_file=True`` re-reads ``config.AUDIT_LOG_PATH`` and verifies that.
+    """
     with _LOCK:
+        entries = _load_audit_from_file() if from_file else list(_AUDIT)
         prev_hash = GENESIS_HASH
-        for index, entry in enumerate(_AUDIT):
+        for index, entry in enumerate(entries):
             expected_seq = index + 1
             if entry.get("seq") != expected_seq:
                 return {
@@ -510,7 +559,7 @@ def verify_audit_chain(correlation_id: str = "") -> Dict[str, Any]:
                     "checked": index,
                     "diverged_at": entry.get("seq"),
                     "reason": "SEQ_GAP",
-                    "head_hash": _AUDIT[-1]["hash"] if _AUDIT else GENESIS_HASH,
+                    "head_hash": entries[-1]["hash"] if entries else GENESIS_HASH,
                 }
             if entry.get("prev_hash") != prev_hash:
                 return {
@@ -519,7 +568,7 @@ def verify_audit_chain(correlation_id: str = "") -> Dict[str, Any]:
                     "checked": index,
                     "diverged_at": entry.get("seq"),
                     "reason": "PREV_HASH_MISMATCH",
-                    "head_hash": _AUDIT[-1]["hash"] if _AUDIT else GENESIS_HASH,
+                    "head_hash": entries[-1]["hash"] if entries else GENESIS_HASH,
                 }
             try:
                 recomputed: Optional[str] = _compute_hash(entry)
@@ -532,14 +581,14 @@ def verify_audit_chain(correlation_id: str = "") -> Dict[str, Any]:
                     "checked": index,
                     "diverged_at": entry.get("seq"),
                     "reason": "HASH_MISMATCH",
-                    "head_hash": _AUDIT[-1]["hash"] if _AUDIT else GENESIS_HASH,
+                    "head_hash": entries[-1]["hash"] if entries else GENESIS_HASH,
                 }
             prev_hash = entry["hash"]
 
         return {
             "ok": True,
             "valid": True,
-            "checked": len(_AUDIT),
+            "checked": len(entries),
             "head_hash": prev_hash,
         }
 
