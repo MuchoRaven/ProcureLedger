@@ -9,6 +9,19 @@ is a public function in ``tools.py``. ``ingest_invoice``, ``approve_payout``,
 ``_execute_payout``, ``get_approval`` and ``verify_audit_chain`` are therefore
 app-layer only: reachable over HTTP, never by the model.
 
+Client configuration
+--------------------
+The client targets Vultr Serverless Inference. Resolution order for each
+setting is environment variable, then ``config``, then a hardcoded default:
+
+* API key  - ``OPENAI_API_KEY``
+* Base URL - ``OPENAI_API_BASE``, then ``OPENAI_BASE_URL``
+* Model    - ``VULTR_MODEL``, defaulting to ``deepseek-v4.1-flash-1017``
+
+Reading the environment first means a deployment can be repointed without
+editing ``config.py``, and the ``config`` fallback keeps the module importable
+if ``config.py`` predates ``OPENAI_API_BASE``.
+
 Audit bracketing
 ----------------
 Every allowlisted tool call is wrapped in two audit links,
@@ -35,6 +48,7 @@ machine-readable ``error``:
 from __future__ import annotations
 
 import json
+import os
 from typing import Any, Dict, List
 
 import config
@@ -150,17 +164,52 @@ SYSTEM_PROMPT = (
 )
 
 # ---------------------------------------------------------------------------
-# Client
+# Client configuration
 # ---------------------------------------------------------------------------
+
+_DEFAULT_BASE_URL = "https://api.vultrinference.com/v1"
+_DEFAULT_MODEL = "deepseek-v4.1-flash-1017"
+
+
+def _api_key() -> str:
+    """Resolve the API key: environment first, then ``config``."""
+    return (
+        os.environ.get("OPENAI_API_KEY")
+        or getattr(config, "OPENAI_API_KEY", "")
+        or ""
+    ).strip()
+
+
+def _base_url() -> str:
+    """Resolve the base URL: ``OPENAI_API_BASE``, then ``OPENAI_BASE_URL``."""
+    for name in ("OPENAI_API_BASE", "OPENAI_BASE_URL"):
+        value = (os.environ.get(name) or "").strip()
+        if value:
+            return value
+    for attr in ("OPENAI_API_BASE", "OPENAI_BASE_URL"):
+        value = (getattr(config, attr, "") or "").strip()
+        if value:
+            return value
+    return _DEFAULT_BASE_URL
+
+
+def _model() -> str:
+    """Resolve the model name, defaulting to the locked Vultr model."""
+    return (
+        (os.environ.get("VULTR_MODEL") or "").strip()
+        or (getattr(config, "VULTR_MODEL", "") or "").strip()
+        or _DEFAULT_MODEL
+    )
 
 
 def _client():
     """Build the OpenAI-compatible client, or raise ``RuntimeError``."""
-    if not config.OPENAI_API_KEY:
+    api_key = _api_key()
+    if not api_key:
         raise RuntimeError("API key not set: set OPENAI_API_KEY")
     from openai import OpenAI
 
-    return OpenAI(api_key=config.OPENAI_API_KEY, base_url=config.OPENAI_BASE_URL)
+    return OpenAI(api_key=api_key, base_url=_base_url())
 
 # ---------------------------------------------------------------------------
 # Audit bracketing
@@ -263,6 +312,7 @@ def run_agent_cycle(
 ) -> Dict[str, Any]:
     """Drive the model/tool loop until it answers or the step cap is hit."""
     max_steps = min(config.AGENT_MAX_STEPS, _HARD_MAX_STEPS)
+    model = _model()
     messages: List[Dict[str, Any]] = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": user_message},
@@ -272,7 +322,7 @@ def run_agent_cycle(
     for step in range(max_steps):
         try:
             response = client.chat.completions.create(
-                model=config.VULTR_MODEL,
+                model=model,
                 messages=messages,
                 tools=_TOOL_SCHEMAS,
                 tool_choice="auto",
