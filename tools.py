@@ -21,10 +21,13 @@ single worker (``uvicorn ... --workers 1``); the audit chain is process-local.
 
 Persistence
 -----------
-Every audit link is appended to ``config.AUDIT_LOG_PATH`` as one JSON object
-per line and ``fsync``-ed before the tool call returns. ``verify_audit_chain``
-can re-verify either the in-memory chain (default) or the on-disk chain
-(``from_file=True``).
+``config.AUDIT_LOG_PATH`` (``audit_log.jsonl``) is the source of truth for the
+audit chain. Every link is appended as one canonical JSON object per line and
+``fsync``-ed before the tool call returns. On import, ``_recover_audit_state``
+loads that file back into memory so a restarted process continues the same
+chain instead of forking it. ``verify_audit_chain`` re-verifies the on-disk
+chain by default (``from_file=True``); pass ``from_file=False`` to check the
+in-memory copy instead.
 """
 
 from __future__ import annotations
@@ -174,6 +177,7 @@ _APPROVALS: Dict[str, Dict[str, Any]] = {}
 
 _AUDIT: List[Dict[str, Any]] = []
 _AUDIT_SEQ = 0
+_AUDIT_RECOVERY_ERROR = ""
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -190,7 +194,7 @@ def _now() -> str:
 
 
 def _canonical(obj: Any) -> str:
-    """Deterministic JSON encoding used for hashing."""
+    """Deterministic JSON encoding used for hashing and for the audit log."""
     return json.dumps(obj, sort_keys=True, separators=(",", ":"), default=str)
 
 
@@ -208,42 +212,70 @@ def _compute_hash(entry: Dict[str, Any]) -> str:
 
 
 def _persist_audit(entry: Dict[str, Any]) -> None:
-    """Append one audit link to ``config.AUDIT_LOG_PATH`` and fsync it."""
+    """Append one canonical JSON line to ``config.AUDIT_LOG_PATH`` and fsync it.
+
+    The record is written as ``_canonical(entry) + "\\n"`` so the on-disk bytes
+    are exactly the bytes that were hashed, then ``flush`` + ``os.fsync`` push
+    it to stable storage before the tool call returns.
+    """
     path = config.AUDIT_LOG_PATH
     if not path:
         return
-    line = json.dumps(entry, sort_keys=True, separators=(",", ":"), default=str)
-    with open(path, "a", encoding="utf-8") as fh:
-        fh.write(line + "\n")
-        fh.flush()
-        os.fsync(fh.fileno())
+    line = _canonical(entry)
+    with open(path, "a", encoding="utf-8") as handle:
+        handle.write(line + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
 
 
 def _load_audit_from_file() -> List[Dict[str, Any]]:
-    """Read the on-disk audit chain. Missing file means empty chain."""
+    """Read the on-disk audit chain. Missing file means empty chain.
+
+    Raises ``ToolError("AUDIT_LOG_CORRUPT")`` if a line is not a JSON object,
+    so callers can report the problem instead of silently dropping a link.
+    """
     path = config.AUDIT_LOG_PATH
     if not path or not os.path.exists(path):
         return []
     entries: List[Dict[str, Any]] = []
-    with open(path, "r", encoding="utf-8") as fh:
-        for line in fh:
+    with open(path, "r", encoding="utf-8") as handle:
+        for lineno, line in enumerate(handle, start=1):
             line = line.strip()
             if not line:
                 continue
-            entries.append(json.loads(line))
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError as exc:
+                _fail("AUDIT_LOG_CORRUPT", f"line {lineno}: {exc}")
+            if not isinstance(entry, dict):
+                _fail("AUDIT_LOG_CORRUPT", f"line {lineno}: not a JSON object")
+            entries.append(entry)
     return entries
 
 
 def _append_audit(
     event_type: str, payload: Dict[str, Any], correlation_id: str = ""
 ) -> Dict[str, Any]:
-    """Append one link to the hash chain and return the stored entry."""
+    """Append one link to the hash chain and return the stored entry.
+
+    The link is written to ``audit_log.jsonl`` (canonical JSON + newline,
+    ``flush`` + ``fsync``) *before* it is added to the in-memory chain, so a
+    failed write can never leave memory ahead of disk.
+    """
     global _AUDIT_SEQ
     with _LOCK:
-        _AUDIT_SEQ += 1
-        prev_hash = _AUDIT[-1]["hash"] if _AUDIT else GENESIS_HASH
+        if _AUDIT_RECOVERY_ERROR:
+            # Fail closed: appending on top of an unreadable log would produce
+            # a chain that can never verify.
+            _fail("AUDIT_LOG_CORRUPT", _AUDIT_RECOVERY_ERROR)
+
+        seq = _AUDIT_SEQ + 1
+        prev_hash = GENESIS_HASH
+        if _AUDIT:
+            prev_hash = _AUDIT[-1].get("hash") or GENESIS_HASH
+
         entry: Dict[str, Any] = {
-            "seq": _AUDIT_SEQ,
+            "seq": seq,
             "ts": _now(),
             "event_type": event_type,
             "payload": payload,
@@ -251,9 +283,39 @@ def _append_audit(
             "prev_hash": prev_hash,
         }
         entry["hash"] = _compute_hash(entry)
-        _AUDIT.append(entry)
+
         _persist_audit(entry)
+        _AUDIT.append(entry)
+        _AUDIT_SEQ = seq
         return entry
+
+
+def _recover_audit_state() -> None:
+    """Load ``audit_log.jsonl`` into memory so appends continue the same chain.
+
+    Called once at import time. If the file cannot be parsed, the in-memory
+    chain is left empty and ``_AUDIT_RECOVERY_ERROR`` is set; ``_append_audit``
+    then refuses to write until an operator repairs the log.
+    """
+    global _AUDIT_SEQ, _AUDIT_RECOVERY_ERROR
+    with _LOCK:
+        try:
+            entries = _load_audit_from_file()
+        except ToolError as exc:
+            _AUDIT.clear()
+            _AUDIT_SEQ = 0
+            _AUDIT_RECOVERY_ERROR = f"{exc.code}: {exc.detail}"
+            return
+
+        _AUDIT.clear()
+        _AUDIT.extend(entries)
+
+        last_seq = entries[-1].get("seq") if entries else 0
+        if isinstance(last_seq, int) and not isinstance(last_seq, bool):
+            _AUDIT_SEQ = last_seq
+        else:
+            _AUDIT_SEQ = len(entries)
+        _AUDIT_RECOVERY_ERROR = ""
 
 
 def _transition(
@@ -276,11 +338,12 @@ def _transition(
 
 def _reset_state() -> None:
     """Test hook: clear approvals and the audit chain, keep seed records."""
-    global _AUDIT_SEQ
+    global _AUDIT_SEQ, _AUDIT_RECOVERY_ERROR
     with _LOCK:
         _APPROVALS.clear()
         _AUDIT.clear()
         _AUDIT_SEQ = 0
+        _AUDIT_RECOVERY_ERROR = ""
         for invoice in _INVOICES.values():
             invoice["status"] = "RECEIVED"
             invoice["updated_at"] = invoice["created_at"]
@@ -540,15 +603,31 @@ def get_approval(approval_id: str, correlation_id: str = "") -> Dict[str, Any]:
 
 
 def verify_audit_chain(
-    correlation_id: str = "", from_file: bool = False
+    correlation_id: str = "", from_file: bool = True
 ) -> Dict[str, Any]:
     """Recompute the audit hash chain and report the first divergence.
 
-    ``from_file=False`` (default) verifies the in-memory chain.
-    ``from_file=True`` re-reads ``config.AUDIT_LOG_PATH`` and verifies that.
+    ``from_file=True`` (default) re-reads ``config.AUDIT_LOG_PATH`` and verifies
+    that, so the result reflects what is actually durable on disk.
+    ``from_file=False`` verifies the in-memory chain instead.
     """
     with _LOCK:
-        entries = _load_audit_from_file() if from_file else list(_AUDIT)
+        if from_file:
+            try:
+                entries = _load_audit_from_file()
+            except ToolError as exc:
+                return {
+                    "ok": True,
+                    "valid": False,
+                    "checked": 0,
+                    "diverged_at": None,
+                    "reason": exc.code,
+                    "detail": exc.detail,
+                    "head_hash": GENESIS_HASH,
+                }
+        else:
+            entries = list(_AUDIT)
+
         prev_hash = GENESIS_HASH
         for index, entry in enumerate(entries):
             expected_seq = index + 1
@@ -757,3 +836,11 @@ def _execute_payout(approval_id: str, correlation_id: str = "") -> Dict[str, Any
             "status": "PAID",
             "settled_at": approval["executed_at"],
         }
+
+# ---------------------------------------------------------------------------
+# Startup recovery
+# ---------------------------------------------------------------------------
+
+# Load the durable chain at import so the first append continues it rather than
+# forking a fresh chain on top of an existing audit_log.jsonl.
+_recover_audit_state()
