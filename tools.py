@@ -14,6 +14,13 @@ App-layer only (never exposed to the model)
 * ``approve_payout``  - records a human approval decision.
 * ``_execute_payout`` - settles an approved payout. Private on purpose.
 
+Sandbox support
+---------------
+``sandbox.dispatch`` re-decides every tool call on live state and applies the
+verified proposal through ``_snapshot_for`` and the ``_apply_*`` helpers below.
+Those helpers delegate to the public tool functions, so validation and audit
+logic is not duplicated.
+
 Concurrency
 -----------
 State lives in module globals guarded by ``_LOCK``. Run the server with a
@@ -836,6 +843,102 @@ def _execute_payout(approval_id: str, correlation_id: str = "") -> Dict[str, Any
             "status": "PAID",
             "settled_at": approval["executed_at"],
         }
+
+# ---------------------------------------------------------------------------
+# Sandbox support (control plane)
+# ---------------------------------------------------------------------------
+#
+# ``sandbox.dispatch`` runs ``decisions.decide`` twice: once inside the sandbox
+# against a read-only snapshot, and once here against live state. The proposal
+# that survives the comparison is applied through the helpers below. They
+# delegate to the public tool functions so validation and audit logic lives in
+# exactly one place.
+#
+# Proposal contract (produced by ``decisions.decide``):
+#
+#   read            {"kind": "read", "data": {...}}
+#   transition      {"kind": "transition", "invoice_id": str, "po_id": str}
+#   create_approval {"kind": "create_approval", "vendor_id": str,
+#                    "amount": float, "po_id": str, "invoice_id": str}
+#   audit_note      {"kind": "audit_note", "event_type": str,
+#                    "payload": dict}
+#
+# Proposals carry only inputs, never generated IDs or timestamps, so the
+# sandbox's proposal and the control plane's re-decision compare equal.
+
+
+def _snapshot_for(tool: str) -> Dict[str, Any]:
+    """Return a read-only copy of the state ``tool`` needs to decide.
+
+    The snapshot is serialised into the sandbox request envelope, so it must
+    contain business data only - no secrets, no live references.
+    """
+    with _LOCK:
+        if tool == "lookup_vendor":
+            return {"vendors": {k: dict(v) for k, v in _VENDORS.items()}}
+        if tool == "get_invoice":
+            return {"invoices": {k: dict(v) for k, v in _INVOICES.items()}}
+        if tool == "run_three_way_match":
+            return {
+                "invoices": {k: dict(v) for k, v in _INVOICES.items()},
+                "pos": {k: dict(v) for k, v in _POS.items()},
+                "receipts": {k: dict(v) for k, v in _RECEIPTS.items()},
+            }
+        if tool == "request_payout_approval":
+            return {
+                "vendors": {k: dict(v) for k, v in _VENDORS.items()},
+                "invoices": {k: dict(v) for k, v in _INVOICES.items()},
+                "approvals": {k: dict(v) for k, v in _APPROVALS.items()},
+            }
+        if tool == "log_audit_event":
+            return {}
+        return {}
+
+
+def _apply_transition(
+    proposal: Dict[str, Any], correlation_id: str = ""
+) -> Dict[str, Any]:
+    """Apply a ``transition`` proposal by re-running the three-way match."""
+    invoice_id = proposal.get("invoice_id")
+    po_id = proposal.get("po_id")
+    if not isinstance(invoice_id, str) or not isinstance(po_id, str):
+        return {"ok": False, "error": "INVALID_PROPOSAL", "kind": "transition"}
+    try:
+        return run_three_way_match(invoice_id, po_id, correlation_id)
+    except ToolError as exc:
+        return {"ok": False, "error": exc.code, "detail": exc.detail}
+
+
+def _apply_create_approval(
+    proposal: Dict[str, Any], correlation_id: str = ""
+) -> Dict[str, Any]:
+    """Apply a ``create_approval`` proposal by opening the approval gate."""
+    vendor_id = proposal.get("vendor_id")
+    po_id = proposal.get("po_id")
+    invoice_id = proposal.get("invoice_id")
+    amount = proposal.get("amount")
+    if not all(isinstance(v, str) for v in (vendor_id, po_id, invoice_id)):
+        return {"ok": False, "error": "INVALID_PROPOSAL", "kind": "create_approval"}
+    try:
+        return request_payout_approval(
+            vendor_id, amount, po_id, invoice_id, correlation_id
+        )
+    except ToolError as exc:
+        return {"ok": False, "error": exc.code, "detail": exc.detail}
+
+
+def _apply_audit_note(
+    proposal: Dict[str, Any], correlation_id: str = ""
+) -> Dict[str, Any]:
+    """Apply an ``audit_note`` proposal by appending the reasoning note."""
+    event_type = proposal.get("event_type")
+    payload = proposal.get("payload")
+    if not isinstance(event_type, str) or not isinstance(payload, dict):
+        return {"ok": False, "error": "INVALID_PROPOSAL", "kind": "audit_note"}
+    try:
+        return log_audit_event(event_type, payload, correlation_id)
+    except ToolError as exc:
+        return {"ok": False, "error": exc.code, "detail": exc.detail}
 
 # ---------------------------------------------------------------------------
 # Startup recovery
