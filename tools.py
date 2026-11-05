@@ -39,6 +39,17 @@ chain instead of forking it. ``verify_audit_chain`` re-verifies the on-disk
 chain by default (``from_file=True``); pass ``from_file=False`` to check the
 in-memory copy instead.
 
+Ordering (audit before mutation)
+--------------------------------
+Every mutating tool routes its state change through ``_commit``. ``_commit``
+writes the audit link to disk *first* and only then applies the mutation, all
+under ``_LOCK``. A failed write (``ToolError("AUDIT_WRITE_FAILED")``) therefore
+leaves business state untouched, so the caller can retry instead of being told
+the call failed while the mutation is already durable and unrecorded. If the
+mutation itself raises (it should not, since callers validate first), the
+in-memory chain and the on-disk link are rolled back so memory and disk stay
+consistent.
+
 Filesystem failures
 -------------------
 ``_persist_audit`` and ``_load_audit_from_file`` translate ``OSError`` into
@@ -56,7 +67,7 @@ import os
 import threading
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import config
 
@@ -191,6 +202,10 @@ _INVOICES: Dict[str, Dict[str, Any]] = {
     },
 }
 
+# Snapshot of the seed invoices so ``_reset_state`` can drop records added by
+# ``ingest_invoice`` instead of leaking them into the next test.
+_SEED_INVOICE_IDS = frozenset(_INVOICES.keys())
+
 _APPROVALS: Dict[str, Dict[str, Any]] = {}
 
 _AUDIT: List[Dict[str, Any]] = []
@@ -227,6 +242,20 @@ def _compute_hash(entry: Dict[str, Any]) -> str:
         "prev_hash": entry["prev_hash"],
     }
     return hashlib.sha256(_canonical(body).encode("utf-8")).hexdigest()
+
+
+def _head_hash(entries: List[Dict[str, Any]]) -> str:
+    """Return the hash of the last entry, tolerating a malformed tail.
+
+    ``verify_audit_chain`` reports divergence on a malformed entry; it must not
+    itself raise ``KeyError`` when the last entry is missing ``hash``.
+    """
+    if not entries:
+        return GENESIS_HASH
+    last = entries[-1]
+    if isinstance(last, dict):
+        return last.get("hash") or GENESIS_HASH
+    return GENESIS_HASH
 
 
 def _persist_audit(entry: Dict[str, Any]) -> None:
@@ -285,6 +314,27 @@ def _load_audit_from_file() -> List[Dict[str, Any]]:
     return entries
 
 
+def _build_audit_entry(
+    event_type: str, payload: Dict[str, Any], correlation_id: str = ""
+) -> Dict[str, Any]:
+    """Build the next audit link. Caller must hold ``_LOCK``."""
+    seq = _AUDIT_SEQ + 1
+    prev_hash = GENESIS_HASH
+    if _AUDIT:
+        prev_hash = _AUDIT[-1].get("hash") or GENESIS_HASH
+
+    entry: Dict[str, Any] = {
+        "seq": seq,
+        "ts": _now(),
+        "event_type": event_type,
+        "payload": payload,
+        "correlation_id": correlation_id or "",
+        "prev_hash": prev_hash,
+    }
+    entry["hash"] = _compute_hash(entry)
+    return entry
+
+
 def _append_audit(
     event_type: str, payload: Dict[str, Any], correlation_id: str = ""
 ) -> Dict[str, Any]:
@@ -293,6 +343,9 @@ def _append_audit(
     The link is written to ``audit_log.jsonl`` (canonical JSON + newline,
     ``flush`` + ``fsync``) *before* it is added to the in-memory chain, so a
     failed write can never leave memory ahead of disk.
+
+    This is for audit-only events (``log_audit_event``) that do not mutate
+    business state. Mutating tools must go through ``_commit`` instead.
     """
     global _AUDIT_SEQ
     with _LOCK:
@@ -301,25 +354,66 @@ def _append_audit(
             # a chain that can never verify.
             _fail("AUDIT_LOG_CORRUPT", _AUDIT_RECOVERY_ERROR)
 
-        seq = _AUDIT_SEQ + 1
-        prev_hash = GENESIS_HASH
-        if _AUDIT:
-            prev_hash = _AUDIT[-1].get("hash") or GENESIS_HASH
-
-        entry: Dict[str, Any] = {
-            "seq": seq,
-            "ts": _now(),
-            "event_type": event_type,
-            "payload": payload,
-            "correlation_id": correlation_id or "",
-            "prev_hash": prev_hash,
-        }
-        entry["hash"] = _compute_hash(entry)
-
+        entry = _build_audit_entry(event_type, payload, correlation_id)
         _persist_audit(entry)
         _AUDIT.append(entry)
-        _AUDIT_SEQ = seq
+        _AUDIT_SEQ = entry["seq"]
         return entry
+
+
+def _commit(
+    mutation: Callable[[], Any],
+    event_type: str,
+    payload: Dict[str, Any],
+    correlation_id: str = "",
+) -> Any:
+    """Persist the audit link, then apply ``mutation``, atomically under ``_LOCK``.
+
+    The audit link is written to disk *before* the in-memory state changes, so
+    a failed write (``ToolError("AUDIT_WRITE_FAILED")``) leaves business state
+    untouched and the caller can safely retry. If the mutation itself raises
+    (it should not, since callers validate first), the in-memory chain and the
+    on-disk link are rolled back so memory and disk stay consistent.
+    """
+    global _AUDIT_SEQ
+    with _LOCK:
+        if _AUDIT_RECOVERY_ERROR:
+            _fail("AUDIT_LOG_CORRUPT", _AUDIT_RECOVERY_ERROR)
+
+        prev_seq = _AUDIT_SEQ
+        entry = _build_audit_entry(event_type, payload, correlation_id)
+
+        # Snapshot the on-disk length so a failed mutation can be rolled back.
+        path = config.AUDIT_LOG_PATH
+        pre_size: Optional[int] = None
+        if path:
+            try:
+                pre_size = os.path.getsize(path) if os.path.exists(path) else 0
+            except OSError:
+                pre_size = None
+
+        # Write the audit link first. If this raises, no state has changed.
+        _persist_audit(entry)
+
+        _AUDIT.append(entry)
+        _AUDIT_SEQ = entry["seq"]
+        try:
+            return mutation()
+        except Exception:
+            # Mutation failed after the audit link was written. Roll back the
+            # in-memory chain and truncate the on-disk link so memory and disk
+            # stay consistent.
+            _AUDIT.pop()
+            _AUDIT_SEQ = prev_seq
+            if path and pre_size is not None:
+                try:
+                    with open(path, "r+b") as handle:
+                        handle.truncate(pre_size)
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                except OSError:
+                    pass
+            raise
 
 
 def _recover_audit_state() -> None:
@@ -377,13 +471,20 @@ def _transition(
 
 
 def _reset_state() -> None:
-    """Test hook: clear approvals and the audit chain, keep seed records."""
+    """Test hook: clear approvals and the audit chain, keep seed records.
+
+    Invoices added by ``ingest_invoice`` are removed so a test that ingests
+    does not leak into the next test.
+    """
     global _AUDIT_SEQ, _AUDIT_RECOVERY_ERROR
     with _LOCK:
         _APPROVALS.clear()
         _AUDIT.clear()
         _AUDIT_SEQ = 0
         _AUDIT_RECOVERY_ERROR = ""
+        for invoice_id in list(_INVOICES.keys()):
+            if invoice_id not in _SEED_INVOICE_IDS:
+                del _INVOICES[invoice_id]
         for invoice in _INVOICES.values():
             invoice["status"] = "RECEIVED"
             invoice["updated_at"] = invoice["created_at"]
@@ -459,8 +560,12 @@ def run_three_way_match(
             mismatch_codes.append("AMOUNT_MISMATCH")
 
         status = "MATCHED" if not mismatch_codes else "EXCEPTION"
-        _transition(invoice_id, ("RECEIVED", "EXCEPTION"), status, correlation_id)
-        _append_audit(
+
+        def mutation() -> None:
+            _transition(invoice_id, ("RECEIVED", "EXCEPTION"), status, correlation_id)
+
+        _commit(
+            mutation,
             "THREE_WAY_MATCH",
             {
                 "invoice_id": invoice_id,
@@ -578,9 +683,15 @@ def request_payout_approval(
             "decided_at": None,
             "executed_at": None,
         }
-        _APPROVALS[approval_id] = approval
-        _transition(invoice_id, ("MATCHED",), "PENDING_APPROVAL", correlation_id)
-        _append_audit(
+
+        def mutation() -> None:
+            # Transition first: it is the only fallible step, so a failure
+            # leaves no partial state behind.
+            _transition(invoice_id, ("MATCHED",), "PENDING_APPROVAL", correlation_id)
+            _APPROVALS[approval_id] = approval
+
+        _commit(
+            mutation,
             "PAYOUT_APPROVAL_REQUESTED",
             {
                 "approval_id": approval_id,
@@ -678,7 +789,7 @@ def verify_audit_chain(
                     "checked": index,
                     "diverged_at": entry.get("seq"),
                     "reason": "SEQ_GAP",
-                    "head_hash": entries[-1]["hash"] if entries else GENESIS_HASH,
+                    "head_hash": _head_hash(entries),
                 }
             if entry.get("prev_hash") != prev_hash:
                 return {
@@ -687,7 +798,7 @@ def verify_audit_chain(
                     "checked": index,
                     "diverged_at": entry.get("seq"),
                     "reason": "PREV_HASH_MISMATCH",
-                    "head_hash": entries[-1]["hash"] if entries else GENESIS_HASH,
+                    "head_hash": _head_hash(entries),
                 }
             try:
                 recomputed: Optional[str] = _compute_hash(entry)
@@ -700,7 +811,7 @@ def verify_audit_chain(
                     "checked": index,
                     "diverged_at": entry.get("seq"),
                     "reason": "HASH_MISMATCH",
-                    "head_hash": entries[-1]["hash"] if entries else GENESIS_HASH,
+                    "head_hash": _head_hash(entries),
                 }
             prev_hash = entry["hash"]
 
@@ -762,8 +873,12 @@ def ingest_invoice(
             "created_at": now,
             "updated_at": now,
         }
-        _INVOICES[invoice_id] = invoice
-        _append_audit(
+
+        def mutation() -> None:
+            _INVOICES[invoice_id] = invoice
+
+        _commit(
+            mutation,
             "INVOICE_INGESTED",
             {
                 "invoice_id": invoice_id,
@@ -812,17 +927,27 @@ def approve_payout(
                 "status": invoice["status"],
             }
 
-        approval["status"] = "APPROVED"
-        approval["approver"] = approver.strip()
-        approval["decided_at"] = _now()
-        _transition(
-            approval["invoice_id"], ("PENDING_APPROVAL",), "APPROVED", correlation_id
-        )
-        _append_audit(
+        clean_approver = approver.strip()
+
+        def mutation() -> None:
+            # Transition first: it is the only fallible step, so a failure
+            # leaves no partial state behind.
+            _transition(
+                approval["invoice_id"],
+                ("PENDING_APPROVAL",),
+                "APPROVED",
+                correlation_id,
+            )
+            approval["status"] = "APPROVED"
+            approval["approver"] = clean_approver
+            approval["decided_at"] = _now()
+
+        _commit(
+            mutation,
             "PAYOUT_APPROVED",
             {
                 "approval_id": approval_id,
-                "approver": approval["approver"],
+                "approver": clean_approver,
                 "amount": approval["amount"],
             },
             correlation_id,
@@ -866,10 +991,15 @@ def _execute_payout(approval_id: str, correlation_id: str = "") -> Dict[str, Any
                 "status": invoice["status"],
             }
 
-        approval["status"] = "EXECUTED"
-        approval["executed_at"] = _now()
-        _transition(invoice["invoice_id"], ("APPROVED",), "PAID", correlation_id)
-        _append_audit(
+        def mutation() -> None:
+            # Transition first: it is the only fallible step, so a failure
+            # leaves no partial state behind.
+            _transition(invoice["invoice_id"], ("APPROVED",), "PAID", correlation_id)
+            approval["status"] = "EXECUTED"
+            approval["executed_at"] = _now()
+
+        _commit(
+            mutation,
             "PAYOUT_EXECUTED",
             {
                 "approval_id": approval_id,
