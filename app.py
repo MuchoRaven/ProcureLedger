@@ -15,6 +15,12 @@ that cannot sandbox fails at boot rather than on the first tool call, where the
 failure would be reported to the model as a tool error and the run would still
 return ``ok: true``.
 
+The lifespan hook also takes an exclusive ``fcntl.flock`` on
+``<AUDIT_LOG_PATH>.lock``. The audit chain is process-local (``tools._LOCK``
+guards in-memory state), so a second worker would fork the chain. A second
+worker therefore fails at boot with a clear message instead of silently
+corrupting the log. Run with ``--workers 1``.
+
 Error contract
 --------------
 * ``tools.ToolError`` (business/integrity errors) -> structured JSON via the
@@ -33,6 +39,7 @@ the JSON body still wins, for backwards compatibility with existing callers.
 
 from __future__ import annotations
 
+import fcntl
 import uuid
 from contextlib import asynccontextmanager
 from typing import Any, Dict, Optional
@@ -42,15 +49,54 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, confloat
 
 import agent
+import config
 import sandbox
 import tools
 
 
+def _acquire_single_worker_lock() -> Optional[Any]:
+    """Take an exclusive lock on ``<AUDIT_LOG_PATH>.lock``.
+
+    The audit chain is process-local, so two workers would fork it. ``flock``
+    is advisory but sufficient here: every ProcureLedger process takes the same
+    lock at boot, so a second worker fails fast instead of silently corrupting
+    the chain. Returns the open handle (to be released on shutdown), or
+    ``None`` when no audit log is configured.
+    """
+    path = config.AUDIT_LOG_PATH
+    if not path:
+        return None
+    lock_path = path + ".lock"
+    handle = open(lock_path, "a+", encoding="utf-8")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.close()
+        raise RuntimeError(
+            "another ProcureLedger worker holds the audit lock; "
+            "run with --workers 1"
+        )
+    return handle
+
+
+def _release_single_worker_lock(handle: Optional[Any]) -> None:
+    if handle is None:
+        return
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    finally:
+        handle.close()
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    """Refuse to serve if this host cannot run the sandbox."""
+    """Refuse to serve if this host cannot sandbox or is a second worker."""
     sandbox.preflight()
-    yield
+    lock_handle = _acquire_single_worker_lock()
+    try:
+        yield
+    finally:
+        _release_single_worker_lock(lock_handle)
 
 
 app = FastAPI(title="ProcureLedger", lifespan=lifespan)
@@ -68,6 +114,8 @@ _AGENT_FATAL_ERRORS = {"CLIENT_INIT_FAILED", "MODEL_CALL_FAILED"}
 # Business error code -> HTTP status. Anything unmapped is a 400.
 _TOOL_ERROR_STATUS = {
     "AUDIT_LOG_CORRUPT": 503,
+    "AUDIT_LOG_UNREADABLE": 503,
+    "AUDIT_WRITE_FAILED": 503,
     "INVOICE_NOT_FOUND": 404,
     "APPROVAL_NOT_FOUND": 404,
     "INVALID_TRANSITION": 409,
@@ -168,15 +216,32 @@ def run_agent(req: RunRequest, cid: str = Depends(correlation_id_header)) -> Any
 
 
 @app.get("/audit")
-def read_audit() -> Dict[str, Any]:
-    """Return the durable audit chain.
+def read_audit(limit: int = 100, offset: int = 0) -> Dict[str, Any]:
+    """Return a page of the durable audit chain.
 
-    Delegates to the tool layer's loader so a corrupt log raises
-    ``ToolError("AUDIT_LOG_CORRUPT")`` and is rendered by the handler above as
-    a structured 503, instead of an unhandled ``JSONDecodeError`` traceback.
+    Delegates to the tool layer's loader so a corrupt or unreadable log raises
+    ``ToolError`` and is rendered by the handler above as a structured 503,
+    instead of an unhandled ``JSONDecodeError``/``OSError`` traceback.
+
+    ``limit`` is capped at 1000 so a single request cannot pull an unbounded
+    chain into memory. ``total`` is the full chain length, so a client can page
+    without guessing.
     """
+    if limit < 1 or limit > 1000:
+        raise HTTPException(
+            status_code=400, detail="limit must be between 1 and 1000"
+        )
+    if offset < 0:
+        raise HTTPException(status_code=400, detail="offset must be >= 0")
+
     entries = tools._load_audit_from_file()
-    return {"ok": True, "entries": entries}
+    return {
+        "ok": True,
+        "entries": entries[offset : offset + limit],
+        "total": len(entries),
+        "limit": limit,
+        "offset": offset,
+    }
 
 
 @app.get("/audit/verify")

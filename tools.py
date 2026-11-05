@@ -25,6 +25,9 @@ Concurrency
 -----------
 State lives in module globals guarded by ``_LOCK``. Run the server with a
 single worker (``uvicorn ... --workers 1``); the audit chain is process-local.
+``app.lifespan`` enforces this with an exclusive lock on
+``<AUDIT_LOG_PATH>.lock`` so a second worker fails at boot instead of forking
+the chain.
 
 Persistence
 -----------
@@ -35,6 +38,14 @@ loads that file back into memory so a restarted process continues the same
 chain instead of forking it. ``verify_audit_chain`` re-verifies the on-disk
 chain by default (``from_file=True``); pass ``from_file=False`` to check the
 in-memory copy instead.
+
+Filesystem failures
+-------------------
+``_persist_audit`` and ``_load_audit_from_file`` translate ``OSError`` into
+``ToolError`` (``AUDIT_WRITE_FAILED`` / ``AUDIT_LOG_UNREADABLE``) so a disk
+problem surfaces as a structured error instead of an unhandled 500. The
+``_apply_*`` helpers and ``agent._audit`` already catch ``ToolError``, so a
+failed write can never leave a dangling ``TOOL_CALL_STARTED`` link.
 """
 
 from __future__ import annotations
@@ -224,39 +235,53 @@ def _persist_audit(entry: Dict[str, Any]) -> None:
     The record is written as ``_canonical(entry) + "\\n"`` so the on-disk bytes
     are exactly the bytes that were hashed, then ``flush`` + ``os.fsync`` push
     it to stable storage before the tool call returns.
+
+    A filesystem failure (disk full, permissions, read-only mount) is
+    translated into ``ToolError("AUDIT_WRITE_FAILED")`` so it surfaces as a
+    structured error rather than an unhandled 500. Callers already catch
+    ``ToolError``, so a failed write can never leave a dangling
+    ``TOOL_CALL_STARTED`` link.
     """
     path = config.AUDIT_LOG_PATH
     if not path:
         return
     line = _canonical(entry)
-    with open(path, "a", encoding="utf-8") as handle:
-        handle.write(line + "\n")
-        handle.flush()
-        os.fsync(handle.fileno())
+    try:
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(line + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+    except OSError as exc:
+        _fail("AUDIT_WRITE_FAILED", str(exc))
 
 
 def _load_audit_from_file() -> List[Dict[str, Any]]:
     """Read the on-disk audit chain. Missing file means empty chain.
 
     Raises ``ToolError("AUDIT_LOG_CORRUPT")`` if a line is not a JSON object,
-    so callers can report the problem instead of silently dropping a link.
+    and ``ToolError("AUDIT_LOG_UNREADABLE")`` if the file cannot be read, so
+    callers can report the problem instead of silently dropping a link or
+    crashing with an unhandled ``OSError``.
     """
     path = config.AUDIT_LOG_PATH
     if not path or not os.path.exists(path):
         return []
     entries: List[Dict[str, Any]] = []
-    with open(path, "r", encoding="utf-8") as handle:
-        for lineno, line in enumerate(handle, start=1):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                entry = json.loads(line)
-            except json.JSONDecodeError as exc:
-                _fail("AUDIT_LOG_CORRUPT", f"line {lineno}: {exc}")
-            if not isinstance(entry, dict):
-                _fail("AUDIT_LOG_CORRUPT", f"line {lineno}: not a JSON object")
-            entries.append(entry)
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            for lineno, line in enumerate(handle, start=1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    _fail("AUDIT_LOG_CORRUPT", f"line {lineno}: {exc}")
+                if not isinstance(entry, dict):
+                    _fail("AUDIT_LOG_CORRUPT", f"line {lineno}: not a JSON object")
+                entries.append(entry)
+    except OSError as exc:
+        _fail("AUDIT_LOG_UNREADABLE", str(exc))
     return entries
 
 
@@ -300,9 +325,9 @@ def _append_audit(
 def _recover_audit_state() -> None:
     """Load ``audit_log.jsonl`` into memory so appends continue the same chain.
 
-    Called once at import time. If the file cannot be parsed, the in-memory
-    chain is left empty and ``_AUDIT_RECOVERY_ERROR`` is set; ``_append_audit``
-    then refuses to write until an operator repairs the log.
+    Called once at import time. If the file cannot be parsed or read, the
+    in-memory chain is left empty and ``_AUDIT_RECOVERY_ERROR`` is set;
+    ``_append_audit`` then refuses to write until an operator repairs the log.
     """
     global _AUDIT_SEQ, _AUDIT_RECOVERY_ERROR
     with _LOCK:
@@ -312,6 +337,14 @@ def _recover_audit_state() -> None:
             _AUDIT.clear()
             _AUDIT_SEQ = 0
             _AUDIT_RECOVERY_ERROR = f"{exc.code}: {exc.detail}"
+            return
+        except OSError as exc:
+            # Defensive: ``_load_audit_from_file`` already converts OSError to
+            # ToolError, but a future refactor must not turn a bad log into an
+            # import-time traceback.
+            _AUDIT.clear()
+            _AUDIT_SEQ = 0
+            _AUDIT_RECOVERY_ERROR = f"AUDIT_LOG_UNREADABLE: {exc}"
             return
 
         _AUDIT.clear()
@@ -706,6 +739,17 @@ def ingest_invoice(
             return {"ok": False, "error": "VENDOR_NOT_FOUND", "vendor_id": vendor_id}
         if po_id not in _POS:
             return {"ok": False, "error": "PO_NOT_FOUND", "po_id": po_id}
+
+        # Reject an invoice whose PO belongs to a different vendor at ingest,
+        # rather than accepting it and failing later in ``run_three_way_match``.
+        po = _POS[po_id]
+        if po["vendor_id"] != vendor_id:
+            return {
+                "ok": False,
+                "error": "VENDOR_MISMATCH",
+                "vendor_id": vendor_id,
+                "po_vendor_id": po["vendor_id"],
+            }
 
         now = _now()
         invoice: Dict[str, Any] = {

@@ -32,6 +32,14 @@ Containment properties
   ``--die-with-parent`` tears it down with the process. No reuse, no warm
   pool, and nothing to clean up on the host.
 
+Error detail
+------------
+A non-zero exit from the sandbox is reported to the caller as
+``SANDBOX_VIOLATION`` with only the exit code in ``detail``. The captured
+stderr is logged server-side at ``WARNING`` and never crosses the boundary:
+it can contain host paths, and ``detail`` flows back through ``dispatch`` to
+the agent and the model.
+
 Availability
 ------------
 ``preflight`` is called from the app's startup hook and raises if ``bwrap`` or
@@ -42,6 +50,7 @@ on the first tool call.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import shutil
 import subprocess
@@ -52,6 +61,8 @@ from typing import Any, Dict, Optional, Tuple
 import config
 import decisions
 import tools
+
+_LOG = logging.getLogger(__name__)
 
 # Binaries the sandbox cannot run without. Checked by ``preflight``.
 _REQUIRED_BINARIES = ("bwrap", "prlimit")
@@ -158,10 +169,18 @@ def _spawn(request: Dict[str, Any]) -> _SpawnResult:
         return _SpawnResult(error="SANDBOX_SPAWN_FAILED", detail=str(exc))
 
     if proc.returncode != 0:
+        # Log stderr server-side only. It can contain host paths, and
+        # ``detail`` flows back through ``dispatch`` to the agent and model.
         stderr = proc.stderr.decode("utf-8", "replace")[:512]
+        _LOG.warning(
+            "sandbox violation: run_id=%s exit=%s stderr=%r",
+            request.get("run_id"),
+            proc.returncode,
+            stderr,
+        )
         return _SpawnResult(
             error="SANDBOX_VIOLATION",
-            detail=f"exit {proc.returncode}: {stderr}",
+            detail=f"exit {proc.returncode}",
         )
 
     try:
