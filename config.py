@@ -17,3 +17,12 @@ VULTR_MODEL = os.environ.get("VULTR_MODEL", "deepseek-v4.1-flash-1017")
 AGENT_MAX_STEPS = int(os.environ.get("AGENT_MAX_STEPS", "8"))
 
 AUDIT_LOG_PATH = os.environ.get("AUDIT_LOG_PATH", "audit_log.jsonl")
+
+# Sandbox resource caps. Consumed by ``sandbox._bwrap_command`` (``memory_mb``)
+# and ``sandbox._spawn`` (``wall_clock_s``). Parsed at import so a malformed
+# value fails fast at boot instead of surfacing as an ``AttributeError`` on the
+# first tool call.
+SANDBOX_LIMITS = {
+    "memory_mb": int(os.environ.get("SANDBOX_MEMORY_MB", "256")),
+    "wall_clock_s": int(os.environ.get("SANDBOX_WALL_CLOCK_S", "10")),
+}

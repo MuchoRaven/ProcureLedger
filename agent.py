@@ -4,10 +4,15 @@ agent.py
 ProcureLedger - agent loop.
 
 The model reaches tools exclusively through the default-deny ``_DISPATCH``
-allowlist below. Anything not in ``ALLOWED_TOOLS`` is unreachable, even if it
-is a public function in ``tools.py``. ``ingest_invoice``, ``approve_payout``,
-``_execute_payout``, ``get_approval`` and ``verify_audit_chain`` are therefore
-app-layer only: reachable over HTTP, never by the model.
+allowlist below, and every allowlisted call is executed through
+``sandbox.dispatch`` - never by calling ``tools`` directly. Anything not in
+``ALLOWED_TOOLS`` is unreachable, even if it is a public function in
+``tools.py``. ``ingest_invoice``, ``approve_payout``, ``_execute_payout``,
+``get_approval`` and ``verify_audit_chain`` are therefore app-layer only:
+reachable over HTTP, never by the model.
+
+``ALLOWED_TOOLS`` is derived from ``decisions.PROPOSAL_KINDS`` so the agent
+allowlist and the sandbox's accepted-tool set cannot drift apart.
 
 Client configuration
 --------------------
@@ -33,6 +38,11 @@ performing an unrecorded action defeats the point of the chain. If the closing
 link fails the tool has already run, so the result is returned with an
 ``audit_error`` field rather than being discarded.
 
+The bracket writes go straight to ``tools.log_audit_event``, deliberately
+bypassing the sandbox: the control plane's own bookkeeping must not depend on
+the sandbox being healthy, or a broken sandbox would make the chain unwritable
+and the fail-closed check would abort every call before it was even attempted.
+
 Failure contract
 ----------------
 ``run`` does not raise for expected failures. It returns ``ok: False`` with a
@@ -52,6 +62,8 @@ import os
 from typing import Any, Dict, List
 
 import config
+import decisions
+import sandbox
 import tools
 
 # ---------------------------------------------------------------------------
@@ -63,16 +75,13 @@ import tools
 # loop into an unbounded spend.
 _HARD_MAX_STEPS = 8
 
-ALLOWED_TOOLS = {
-    "lookup_vendor",
-    "run_three_way_match",
-    "request_payout_approval",
-    "log_audit_event",
-    "get_invoice",
-}
+# Derived from the sandbox's own table so the two allowlists cannot drift.
+ALLOWED_TOOLS = set(decisions.PROPOSAL_KINDS)
 
 # Built at import so a typo in ``ALLOWED_TOOLS`` fails fast rather than at the
-# first tool call.
+# first tool call. The values are not called directly - execution goes through
+# ``sandbox.dispatch`` - but the lookup proves every allowlisted name exists in
+# ``tools``.
 _DISPATCH = {name: getattr(tools, name) for name in ALLOWED_TOOLS}
 
 # ---------------------------------------------------------------------------
@@ -221,9 +230,11 @@ def _audit(
 ) -> str:
     """Write one audit link. Return an error string, or ``""`` on success.
 
-    ``tools.log_audit_event`` reports bad input in-band and raises
-    ``ToolError`` only when the chain itself is unwritable, so both paths are
-    folded into a single error string here.
+    Calls ``tools.log_audit_event`` directly rather than going through the
+    sandbox: the control plane's own bookkeeping must not depend on the sandbox
+    being healthy. ``tools.log_audit_event`` reports bad input in-band and
+    raises ``ToolError`` only when the chain itself is unwritable, so both paths
+    are folded into a single error string here.
     """
     try:
         result = tools.log_audit_event(
@@ -244,7 +255,7 @@ def _audit(
 def dispatch_tool(
     name: str, arguments: Dict[str, Any], correlation_id: str
 ) -> Dict[str, Any]:
-    """Run one allowlisted tool, bracketed by audit links."""
+    """Run one allowlisted tool through the sandbox, bracketed by audit links."""
     if name not in _DISPATCH:
         return {"ok": False, "error": "TOOL_NOT_ALLOWED", "tool": name}
 
@@ -274,9 +285,10 @@ def dispatch_tool(
                 "tool": name,
             }
 
-    fn = _DISPATCH[name]
     try:
-        result = fn(correlation_id=correlation_id, **arguments)
+        result = sandbox.dispatch(
+            name, arguments, principal=None, correlation_id=correlation_id
+        )
     except tools.ToolError as exc:
         result = {"ok": False, "error": exc.code, "detail": exc.detail}
     except TypeError as exc:

@@ -7,6 +7,14 @@ The agent is reachable only through ``/agent/run``. Human approval and payout
 settlement are deliberately separate endpoints so a model can never settle a
 payout on its own. ``/audit`` and ``/audit/verify`` read the on-disk chain.
 
+Startup
+-------
+``sandbox.preflight`` runs in the lifespan hook and raises if ``bwrap`` or
+``prlimit`` is missing. The sandbox is mandatory in every environment: a host
+that cannot sandbox fails at boot rather than on the first tool call, where the
+failure would be reported to the model as a tool error and the run would still
+return ``ok: true``.
+
 Error contract
 --------------
 * ``tools.ToolError`` (business/integrity errors) -> structured JSON via the
@@ -26,6 +34,7 @@ the JSON body still wins, for backwards compatibility with existing callers.
 from __future__ import annotations
 
 import uuid
+from contextlib import asynccontextmanager
 from typing import Any, Dict, Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
@@ -33,9 +42,18 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, confloat
 
 import agent
+import sandbox
 import tools
 
-app = FastAPI(title="ProcureLedger")
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    """Refuse to serve if this host cannot run the sandbox."""
+    sandbox.preflight()
+    yield
+
+
+app = FastAPI(title="ProcureLedger", lifespan=lifespan)
 
 # Strict positive amount. ``strict=True`` rejects booleans (``True`` would
 # otherwise coerce to ``1.0``) and strings, so the ``isinstance(amount, bool)``

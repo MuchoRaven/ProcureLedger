@@ -28,8 +28,15 @@ Containment properties
 * Resource caps: ``prlimit --as`` for address space, ``--nofile`` and
   ``--nproc`` for file and process counts, ``--core=0`` to suppress dumps.
   Wall clock is enforced by ``subprocess.run(timeout=...)``.
-* Lifecycle: a fresh workspace per run, ``--die-with-parent``, removed in a
-  ``finally``. No reuse, no warm pool.
+* Lifecycle: bwrap creates a fresh tmpfs ``/workspace`` per run and
+  ``--die-with-parent`` tears it down with the process. No reuse, no warm
+  pool, and nothing to clean up on the host.
+
+Availability
+------------
+``preflight`` is called from the app's startup hook and raises if ``bwrap`` or
+``prlimit`` is missing, so a host that cannot sandbox fails at boot rather than
+on the first tool call.
 """
 
 from __future__ import annotations
@@ -38,7 +45,6 @@ import json
 import os
 import shutil
 import subprocess
-import tempfile
 import uuid
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
@@ -46,6 +52,26 @@ from typing import Any, Dict, Optional, Tuple
 import config
 import decisions
 import tools
+
+# Binaries the sandbox cannot run without. Checked by ``preflight``.
+_REQUIRED_BINARIES = ("bwrap", "prlimit")
+
+
+def preflight() -> None:
+    """Fail fast if this host cannot run the sandbox.
+
+    Without this, a host missing ``bwrap`` or ``prlimit`` produces
+    ``SANDBOX_SPAWN_FAILED`` on every tool call, the model sees errors in its
+    transcript, and ``agent.run`` still returns ``ok: True`` with a useless
+    reply - a broken deployment reported as a successful run.
+    """
+    missing = [name for name in _REQUIRED_BINARIES if shutil.which(name) is None]
+    if missing:
+        raise RuntimeError(
+            "sandbox unavailable: missing "
+            + ", ".join(missing)
+            + " (install bubblewrap and util-linux)"
+        )
 
 
 @dataclass
@@ -78,7 +104,7 @@ def _build_request(
     }
 
 
-def _bwrap_command(workspace: str) -> list:
+def _bwrap_command() -> list:
     app_dir = os.path.dirname(os.path.abspath(__file__))
     limits = config.SANDBOX_LIMITS
     cmd = [
@@ -116,46 +142,42 @@ def _bwrap_command(workspace: str) -> list:
 
 
 def _spawn(request: Dict[str, Any]) -> _SpawnResult:
-    workspace = tempfile.mkdtemp(prefix="pl-ws-")
+    cmd = _bwrap_command()
+    payload = json.dumps(request, sort_keys=True, separators=(",", ":"))
     try:
-        cmd = _bwrap_command(workspace)
-        payload = json.dumps(request, sort_keys=True, separators=(",", ":"))
-        try:
-            proc = subprocess.run(
-                cmd,
-                input=payload.encode("utf-8"),
-                capture_output=True,
-                timeout=request["limits"]["wall_clock_s"],
-                check=False,
-            )
-        except subprocess.TimeoutExpired:
-            return _SpawnResult(error="SANDBOX_TIMEOUT", detail="wall clock exceeded")
-        except OSError as exc:
-            return _SpawnResult(error="SANDBOX_SPAWN_FAILED", detail=str(exc))
+        proc = subprocess.run(
+            cmd,
+            input=payload.encode("utf-8"),
+            capture_output=True,
+            timeout=request["limits"]["wall_clock_s"],
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return _SpawnResult(error="SANDBOX_TIMEOUT", detail="wall clock exceeded")
+    except OSError as exc:
+        return _SpawnResult(error="SANDBOX_SPAWN_FAILED", detail=str(exc))
 
-        if proc.returncode != 0:
-            stderr = proc.stderr.decode("utf-8", "replace")[:512]
-            return _SpawnResult(
-                error="SANDBOX_VIOLATION",
-                detail=f"exit {proc.returncode}: {stderr}",
-            )
+    if proc.returncode != 0:
+        stderr = proc.stderr.decode("utf-8", "replace")[:512]
+        return _SpawnResult(
+            error="SANDBOX_VIOLATION",
+            detail=f"exit {proc.returncode}: {stderr}",
+        )
 
-        try:
-            envelope = json.loads(proc.stdout.decode("utf-8"))
-        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-            return _SpawnResult(error="MALFORMED_RESPONSE", detail=str(exc))
+    try:
+        envelope = json.loads(proc.stdout.decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        return _SpawnResult(error="MALFORMED_RESPONSE", detail=str(exc))
 
-        if not isinstance(envelope, dict):
-            return _SpawnResult(error="MALFORMED_RESPONSE", detail="not an object")
+    if not isinstance(envelope, dict):
+        return _SpawnResult(error="MALFORMED_RESPONSE", detail="not an object")
 
-        sandbox_meta = envelope.get("sandbox")
-        if not isinstance(sandbox_meta, dict):
-            sandbox_meta = {}
-        sandbox_meta["exit_code"] = proc.returncode
-        envelope["sandbox"] = sandbox_meta
-        return _SpawnResult(envelope=envelope)
-    finally:
-        shutil.rmtree(workspace, ignore_errors=True)
+    sandbox_meta = envelope.get("sandbox")
+    if not isinstance(sandbox_meta, dict):
+        sandbox_meta = {}
+    sandbox_meta["exit_code"] = proc.returncode
+    envelope["sandbox"] = sandbox_meta
+    return _SpawnResult(envelope=envelope)
 
 
 def _validate(request: Dict[str, Any], envelope: Dict[str, Any]) -> str:
@@ -187,8 +209,13 @@ def _redeci(
     """
     tool = request["tool"]
     arguments = request["arguments"]
-    live = tools._snapshot_for(tool)
-    expected = decisions.decide(tool, arguments, live)
+    try:
+        live = tools._snapshot_for(tool)
+        expected = decisions.decide(tool, arguments, live)
+    except Exception:
+        # Mirror the worker's guard: a raise here must not escape as a 500.
+        return "DECISION_FAILED", None, False
+
     received_ok = envelope.get("ok") is True
 
     if not expected.get("ok"):
