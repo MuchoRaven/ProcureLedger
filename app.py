@@ -347,6 +347,7 @@ _TOOL_ERROR_STATUS = {
     "VENDOR_HIGH_RISK": 409,
     "VENDOR_MISMATCH": 409,
     "PO_INVOICE_MISMATCH": 409,
+    "PO_EXISTS": 409,
     "PO_NOT_OPEN": 409,
     "RECEIPT_EXCEEDS_PO": 409,
     "REQUISITION_NOT_OPEN": 409,
@@ -401,6 +402,15 @@ class CreatePORequest(BaseModel):
     currency: str = "USD"
     expected_delivery: str = ""
     requisition_id: str = ""
+    correlation_id: str = ""
+
+
+class CreateRequisitionRequest(BaseModel):
+    description: str
+    quantity: float
+    amount: Amount
+    vendor_id: str = ""
+    currency: str = "USD"
     correlation_id: str = ""
 
 
@@ -811,6 +821,27 @@ def requisition_index(
     return _respond(list_requisitions(), cid)
 
 
+@app.post("/requisitions")
+def create_requisition(
+    req: CreateRequisitionRequest,
+    cid: str = Depends(correlation_id_header),
+    principal: tools.Principal = Depends(require_operator),
+) -> Any:
+    """Raise a purchase requisition. Operator-only; never reachable by the model."""
+    correlation_id = _resolve_correlation_id(cid, req.correlation_id)
+    return _respond(
+        tools.create_requisition(
+            req.description,
+            req.quantity,
+            req.amount,
+            vendor_id=req.vendor_id,
+            currency=req.currency,
+            correlation_id=correlation_id,
+        ),
+        correlation_id,
+    )
+
+
 @app.get("/requisitions/{requisition_id}")
 def get_requisition(
     requisition_id: str,
@@ -818,6 +849,23 @@ def get_requisition(
     principal: tools.Principal = Depends(require_any),
 ) -> Any:
     return _respond(tools.get_requisition(requisition_id), cid)
+
+
+@app.post("/requisitions/{requisition_id}/cancel")
+def cancel_requisition(
+    requisition_id: str,
+    req: ActionRequest,
+    cid: str = Depends(correlation_id_header),
+    principal: tools.Principal = Depends(require_operator),
+) -> Any:
+    """Cancel an OPEN requisition. Operator-only."""
+    correlation_id = _resolve_correlation_id(cid, req.correlation_id)
+    return _respond(
+        tools.cancel_requisition(
+            requisition_id, correlation_id=correlation_id
+        ),
+        correlation_id,
+    )
 
 
 @app.get("/approvals/{approval_id}")
