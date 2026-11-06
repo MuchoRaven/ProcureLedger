@@ -16,6 +16,8 @@ App-layer only (never exposed to the model)
 * ``record_goods_receipt``   - records a goods receipt against an open PO.
 * ``approve_payout``         - records a human approval decision.
 * ``_execute_payout``        - settles an approved payout. Private on purpose.
+* ``create_requisition``     - registers an internal purchasing demand.
+* ``update_requisition_status`` - converts/cancels an open requisition.
 
 Sandbox support
 ---------------
@@ -38,11 +40,12 @@ Persistence and replay
 audit chain. Every link is appended as one canonical JSON object per line and
 ``fsync``-ed before the tool call returns. On import, ``_recover_audit_state``
 loads that file back into memory *and replays it* to rebuild ``_INVOICES``,
-``_APPROVALS``, ``_POS`` and ``_RECEIPTS``. The chain is durable; the dicts it
-describes are not, so without replay a restart resets every invoice to
-``RECEIVED`` and a paid invoice can be matched and paid again. Replay is
-at-least-once and safe because every transition is status-guarded: a link that
-would move an invoice backwards is skipped with a warning rather than applied.
+``_APPROVALS``, ``_POS``, ``_RECEIPTS`` and ``_REQUISITIONS``. The chain is
+durable; the dicts it describes are not, so without replay a restart resets
+every invoice to ``RECEIVED`` and a paid invoice can be matched and paid again.
+Replay is at-least-once and safe because every transition is status-guarded: a
+link that would move an invoice backwards is skipped with a warning rather than
+applied.
 
 ``verify_audit_chain`` re-verifies the on-disk chain by default
 (``from_file=True``); pass ``from_file=False`` to check the in-memory copy
@@ -65,6 +68,15 @@ Every entry carries ``source``: ``"tool"`` for links the control plane writes,
 ``"agent"`` for model reasoning notes. ``log_audit_event`` refuses the
 tool-authored event types when ``source="agent"``, so a model note cannot
 masquerade as a real approval gate or settlement in the chain.
+
+Requisitions
+------------
+A requisition is an internal purchasing demand that precedes a purchase order.
+``create_requisition`` registers one (``OPEN``); ``update_requisition_status``
+moves it to ``CONVERTED`` (recording the resulting ``po_id``) or
+``CANCELLED``. ``monitor_purchasing_needs`` lists the open demands. Like every
+other record, requisitions are replayed from the chain, so a restart does not
+lose them.
 
 Filesystem failures
 -------------------
@@ -104,6 +116,14 @@ PO_STATUS_OPEN = "OPEN"
 PO_STATUS_CLOSED = "CLOSED"
 PO_STATUS_CANCELLED = "CANCELLED"
 _PO_ALLOWED_TARGETS = frozenset({PO_STATUS_CLOSED, PO_STATUS_CANCELLED})
+
+# Requisition lifecycle. A requisition is an internal purchasing demand that
+# precedes a purchase order. It starts ``OPEN`` and may be ``CONVERTED`` to a
+# PO (recording the resulting ``po_id``) or ``CANCELLED``.
+REQ_STATUS_OPEN = "OPEN"
+REQ_STATUS_CONVERTED = "CONVERTED"
+REQ_STATUS_CANCELLED = "CANCELLED"
+_REQ_ALLOWED_TARGETS = frozenset({REQ_STATUS_CONVERTED, REQ_STATUS_CANCELLED})
 
 # ---------------------------------------------------------------------------
 # Errors
@@ -162,6 +182,8 @@ _RESERVED_EVENT_TYPES = frozenset(
         "PAYOUT_APPROVAL_REQUESTED",
         "PAYOUT_APPROVED",
         "PAYOUT_EXECUTED",
+        "REQUISITION_CREATED",
+        "REQUISITION_STATUS_UPDATED",
         "TOOL_CALL_STARTED",
         "TOOL_CALL_COMPLETED",
     }
@@ -287,6 +309,44 @@ _INVOICES: Dict[str, Dict[str, Any]] = {
 _SEED_INVOICE_IDS = frozenset(_INVOICES.keys())
 
 _APPROVALS: Dict[str, Dict[str, Any]] = {}
+
+# Seed requisitions. ``_REQUISITIONS`` is the live, mutable store; the seed
+# literal is restored by ``_reset_business_state``. A requisition is an
+# internal purchasing demand that precedes a purchase order.
+_SEED_REQUISITIONS: Dict[str, Dict[str, Any]] = {
+    "REQ-3001": {
+        "requisition_id": "REQ-3001",
+        "requested_by": "dana.ops",
+        "department": "Operations",
+        "description": "Replacement conveyor belts",
+        "vendor_id": "VEND-001",
+        "amount": 4200.00,
+        "currency": "USD",
+        "needed_by": "2024-06-01",
+        "status": "OPEN",
+        "po_id": None,
+        "created_at": "2024-05-01T10:00:00Z",
+        "updated_at": "2024-05-01T10:00:00Z",
+    },
+    "REQ-3002": {
+        "requisition_id": "REQ-3002",
+        "requested_by": "lee.warehouse",
+        "department": "Warehouse",
+        "description": "Forklift maintenance kit",
+        "vendor_id": "VEND-002",
+        "amount": 1500.00,
+        "currency": "USD",
+        "needed_by": "2024-05-20",
+        "status": "OPEN",
+        "po_id": None,
+        "created_at": "2024-05-02T09:30:00Z",
+        "updated_at": "2024-05-02T09:30:00Z",
+    },
+}
+
+_REQUISITIONS: Dict[str, Dict[str, Any]] = {
+    k: dict(v) for k, v in _SEED_REQUISITIONS.items()
+}
 
 _AUDIT: List[Dict[str, Any]] = []
 _AUDIT_SEQ = 0
@@ -527,7 +587,7 @@ def _commit(
 
 
 def _reset_business_state() -> None:
-    """Restore invoices/approvals/POs/receipts to the seed literals.
+    """Restore invoices/approvals/POs/receipts/requisitions to the seed literals.
 
     Caller holds ``_LOCK``.
     """
@@ -543,6 +603,8 @@ def _reset_business_state() -> None:
     _POS.update({k: dict(v) for k, v in _SEED_POS.items()})
     _RECEIPTS.clear()
     _RECEIPTS.update({k: dict(v) for k, v in _SEED_RECEIPTS.items()})
+    _REQUISITIONS.clear()
+    _REQUISITIONS.update({k: dict(v) for k, v in _SEED_REQUISITIONS.items()})
 
 
 def _replay_ingest(payload: Dict[str, Any], ts: str) -> None:
@@ -771,6 +833,79 @@ def _replay_executed(payload: Dict[str, Any], ts: str) -> None:
         approval["executor"] = executor.strip()
 
 
+def _replay_requisition_created(payload: Dict[str, Any], ts: str) -> None:
+    requisition_id = payload.get("requisition_id")
+    if not isinstance(requisition_id, str) or not requisition_id:
+        _fail("AUDIT_LOG_CORRUPT", "REQUISITION_CREATED missing requisition_id")
+    if requisition_id in _REQUISITIONS:
+        return
+    requested_by = payload.get("requested_by")
+    description = payload.get("description")
+    amount = payload.get("amount")
+    needed_by = payload.get("needed_by")
+    if not isinstance(requested_by, str) or not requested_by:
+        _fail(
+            "AUDIT_LOG_CORRUPT",
+            f"REQUISITION_CREATED {requisition_id} missing requested_by",
+        )
+    if not isinstance(description, str) or not description:
+        _fail(
+            "AUDIT_LOG_CORRUPT",
+            f"REQUISITION_CREATED {requisition_id} missing description",
+        )
+    if isinstance(amount, bool) or not isinstance(amount, (int, float)):
+        _fail("AUDIT_LOG_CORRUPT", f"REQUISITION_CREATED {requisition_id} bad amount")
+    if not isinstance(needed_by, str) or not needed_by:
+        _fail(
+            "AUDIT_LOG_CORRUPT",
+            f"REQUISITION_CREATED {requisition_id} missing needed_by",
+        )
+    _REQUISITIONS[requisition_id] = {
+        "requisition_id": requisition_id,
+        "requested_by": requested_by,
+        "department": payload.get("department") or "",
+        "description": description,
+        "vendor_id": payload.get("vendor_id"),
+        "amount": float(amount),
+        "currency": payload.get("currency") or "USD",
+        "needed_by": needed_by,
+        "status": REQ_STATUS_OPEN,
+        "po_id": None,
+        "created_at": ts,
+        "updated_at": ts,
+    }
+
+
+def _replay_requisition_status_updated(payload: Dict[str, Any], ts: str) -> None:
+    requisition_id = payload.get("requisition_id")
+    status = payload.get("status")
+    if not isinstance(requisition_id, str) or not requisition_id:
+        _fail("AUDIT_LOG_CORRUPT", "REQUISITION_STATUS_UPDATED missing requisition_id")
+    if status not in _REQ_ALLOWED_TARGETS:
+        _fail(
+            "AUDIT_LOG_CORRUPT",
+            f"REQUISITION_STATUS_UPDATED {requisition_id} bad status",
+        )
+    req = _REQUISITIONS.get(requisition_id)
+    if req is None:
+        _fail(
+            "AUDIT_LOG_CORRUPT",
+            f"REQUISITION_STATUS_UPDATED for unknown requisition {requisition_id}",
+        )
+    if req["status"] != REQ_STATUS_OPEN:
+        _LOG.warning(
+            "replay: skipping REQUISITION_STATUS_UPDATED for %s; status is %s",
+            requisition_id,
+            req["status"],
+        )
+        return
+    req["status"] = status
+    req["updated_at"] = ts
+    po_id = payload.get("po_id")
+    if isinstance(po_id, str) and po_id:
+        req["po_id"] = po_id
+
+
 def _replay_audit_entries(entries: List[Dict[str, Any]]) -> None:
     """Rebuild business state by replaying the durable chain in seq order.
 
@@ -807,6 +942,10 @@ def _replay_audit_entries(entries: List[Dict[str, Any]]) -> None:
             _replay_approved(payload, ts)
         elif event_type == "PAYOUT_EXECUTED":
             _replay_executed(payload, ts)
+        elif event_type == "REQUISITION_CREATED":
+            _replay_requisition_created(payload, ts)
+        elif event_type == "REQUISITION_STATUS_UPDATED":
+            _replay_requisition_status_updated(payload, ts)
 
 
 def _recover_audit_state() -> None:
@@ -881,8 +1020,8 @@ def _reset_state() -> None:
     """Test hook: clear approvals and the audit chain, keep seed records.
 
     Invoices added by ``ingest_invoice`` are removed so a test that ingests
-    does not leak into the next test. POs and receipts are restored to their
-    seed literals for the same reason.
+    does not leak into the next test. POs, receipts and requisitions are
+    restored to their seed literals for the same reason.
     """
     global _AUDIT_SEQ, _AUDIT_RECOVERY_ERROR
     with _LOCK:
@@ -907,6 +1046,32 @@ def lookup_vendor(vendor_id: str, correlation_id: str = "") -> Dict[str, Any]:
         if vendor is None:
             return {"ok": False, "error": "VENDOR_NOT_FOUND", "vendor_id": vendor_id}
         return {"ok": True, "vendor": dict(vendor)}
+
+
+def monitor_purchasing_needs(
+    department: str = "",
+    vendor_id: str = "",
+    correlation_id: str = "",
+) -> Dict[str, Any]:
+    """List open requisitions (internal purchasing demands). Read-only.
+
+    Optional ``department`` and ``vendor_id`` filters narrow the result. Items
+    are ordered by ``needed_by`` then ``requisition_id`` so the most urgent
+    demand is first. Read-only, so it is safe to expose to the model; wiring it
+    into ``agent._DISPATCH`` also requires a ``decisions`` handler.
+    """
+    with _LOCK:
+        items: List[Dict[str, Any]] = []
+        for req in _REQUISITIONS.values():
+            if req["status"] != REQ_STATUS_OPEN:
+                continue
+            if department and req.get("department") != department:
+                continue
+            if vendor_id and req.get("vendor_id") != vendor_id:
+                continue
+            items.append(dict(req))
+        items.sort(key=lambda r: (r.get("needed_by") or "", r["requisition_id"]))
+        return {"ok": True, "requisitions": items, "count": len(items)}
 
 
 def run_three_way_match(
@@ -1484,6 +1649,173 @@ def record_goods_receipt(
         return {"ok": True, "receipt": dict(receipt)}
 
 
+def create_requisition(
+    requested_by: str,
+    description: str,
+    amount: float,
+    needed_by: str,
+    department: str = "",
+    vendor_id: Optional[str] = None,
+    currency: str = "USD",
+    correlation_id: str = "",
+) -> Dict[str, Any]:
+    """Register an internal purchasing demand before it becomes a PO.
+
+    A requisition is the upstream record of a purchasing need. It starts
+    ``OPEN`` and is later converted to a purchase order (``CONVERTED``) or
+    dropped (``CANCELLED``) via ``update_requisition_status``. ``needed_by``
+    must be an ISO ``YYYY-MM-DD`` date string. ``vendor_id`` is optional; when
+    supplied it must reference a known vendor. App-layer only: never exposed to
+    the model.
+    """
+    if not isinstance(requested_by, str) or not requested_by.strip():
+        return {"ok": False, "error": "INVALID_REQUESTED_BY"}
+    if not isinstance(description, str) or not description.strip():
+        return {"ok": False, "error": "INVALID_DESCRIPTION"}
+    if isinstance(amount, bool) or not isinstance(amount, (int, float)):
+        return {"ok": False, "error": "INVALID_AMOUNT", "amount": amount}
+    if amount <= 0:
+        return {"ok": False, "error": "INVALID_AMOUNT", "amount": amount}
+    if not _valid_date(needed_by):
+        return {"ok": False, "error": "INVALID_NEEDED_BY", "needed_by": needed_by}
+    if vendor_id is not None and (
+        not isinstance(vendor_id, str) or not vendor_id.strip()
+    ):
+        return {"ok": False, "error": "INVALID_VENDOR_ID", "vendor_id": vendor_id}
+
+    clean_vendor = (
+        vendor_id.strip()
+        if isinstance(vendor_id, str) and vendor_id.strip()
+        else None
+    )
+    clean_department = department.strip() if isinstance(department, str) else ""
+
+    with _LOCK:
+        if clean_vendor is not None and clean_vendor not in _VENDORS:
+            return {
+                "ok": False,
+                "error": "VENDOR_NOT_FOUND",
+                "vendor_id": clean_vendor,
+            }
+
+        requisition_id = "REQ-" + uuid.uuid4().hex[:8].upper()
+        now = _now()
+        requisition: Dict[str, Any] = {
+            "requisition_id": requisition_id,
+            "requested_by": requested_by.strip(),
+            "department": clean_department,
+            "description": description.strip(),
+            "vendor_id": clean_vendor,
+            "amount": float(amount),
+            "currency": currency or "USD",
+            "needed_by": needed_by.strip(),
+            "status": REQ_STATUS_OPEN,
+            "po_id": None,
+            "created_at": now,
+            "updated_at": now,
+        }
+
+        def mutation() -> None:
+            _REQUISITIONS[requisition_id] = requisition
+
+        _commit(
+            mutation,
+            "REQUISITION_CREATED",
+            {
+                "requisition_id": requisition_id,
+                "requested_by": requisition["requested_by"],
+                "department": requisition["department"],
+                "description": requisition["description"],
+                "vendor_id": requisition["vendor_id"],
+                "amount": requisition["amount"],
+                "currency": requisition["currency"],
+                "needed_by": requisition["needed_by"],
+            },
+            correlation_id,
+        )
+        return {"ok": True, "requisition": dict(requisition)}
+
+
+def update_requisition_status(
+    requisition_id: str,
+    new_status: str,
+    po_id: str = "",
+    correlation_id: str = "",
+) -> Dict[str, Any]:
+    """Move an ``OPEN`` requisition to ``CONVERTED`` or ``CANCELLED``.
+
+    ``po_id`` is required when converting and is recorded on the requisition;
+    it must reference an existing PO whose vendor matches the requisition's
+    vendor (when the requisition names one). App-layer only: never exposed to
+    the model.
+    """
+    if not isinstance(requisition_id, str) or not requisition_id.strip():
+        return {"ok": False, "error": "INVALID_REQUISITION_ID"}
+    if not isinstance(new_status, str) or not new_status.strip():
+        return {"ok": False, "error": "INVALID_STATUS"}
+    clean_status = new_status.strip().upper()
+    if clean_status not in _REQ_ALLOWED_TARGETS:
+        return {
+            "ok": False,
+            "error": "INVALID_STATUS",
+            "status": clean_status,
+            "allowed": sorted(_REQ_ALLOWED_TARGETS),
+        }
+    clean_po_id = po_id.strip() if isinstance(po_id, str) and po_id.strip() else ""
+
+    with _LOCK:
+        req = _REQUISITIONS.get(requisition_id)
+        if req is None:
+            return {
+                "ok": False,
+                "error": "REQUISITION_NOT_FOUND",
+                "requisition_id": requisition_id,
+            }
+        if req["status"] != REQ_STATUS_OPEN:
+            return {
+                "ok": False,
+                "error": "REQUISITION_NOT_OPEN",
+                "requisition_id": requisition_id,
+                "status": req["status"],
+            }
+        if clean_status == REQ_STATUS_CONVERTED and not clean_po_id:
+            return {
+                "ok": False,
+                "error": "PO_ID_REQUIRED",
+                "requisition_id": requisition_id,
+            }
+        if clean_po_id:
+            po = _POS.get(clean_po_id)
+            if po is None:
+                return {"ok": False, "error": "PO_NOT_FOUND", "po_id": clean_po_id}
+            req_vendor = req.get("vendor_id")
+            if req_vendor and po["vendor_id"] != req_vendor:
+                return {
+                    "ok": False,
+                    "error": "VENDOR_MISMATCH",
+                    "requisition_vendor_id": req_vendor,
+                    "po_vendor_id": po["vendor_id"],
+                }
+
+        def mutation() -> None:
+            req["status"] = clean_status
+            req["updated_at"] = _now()
+            if clean_po_id:
+                req["po_id"] = clean_po_id
+
+        _commit(
+            mutation,
+            "REQUISITION_STATUS_UPDATED",
+            {
+                "requisition_id": requisition_id,
+                "status": clean_status,
+                "po_id": clean_po_id or None,
+            },
+            correlation_id,
+        )
+        return {"ok": True, "requisition": dict(req)}
+
+
 def approve_payout(
     approval_id: str, approver: str, correlation_id: str = ""
 ) -> Dict[str, Any]:
@@ -1668,6 +2000,8 @@ def _snapshot_for(tool: str) -> Dict[str, Any]:
             return {"vendors": {k: dict(v) for k, v in _VENDORS.items()}}
         if tool == "get_invoice":
             return {"invoices": {k: dict(v) for k, v in _INVOICES.items()}}
+        if tool == "monitor_purchasing_needs":
+            return {"requisitions": {k: dict(v) for k, v in _REQUISITIONS.items()}}
         if tool == "run_three_way_match":
             return {
                 "invoices": {k: dict(v) for k, v in _INVOICES.items()},
