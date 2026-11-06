@@ -10,6 +10,13 @@ envelope, and once in the control plane against live state
 module must not read the clock, generate IDs, touch the filesystem, or import
 ``tools``/``config``. Anything non-deterministic belongs in ``tools._apply_*``.
 
+``get_invoice_aging`` is the one decider that needs a notion of "today". It
+never reads the clock: the reference date is either the caller's ``as_of``
+argument or the date the control plane froze into the snapshot under
+``snapshot["as_of"]``. Both are ISO date strings, so the arithmetic is pure and
+the sandbox and the control plane always agree. The snapshot must also carry a
+``due_date`` on each invoice; see ``tools._snapshot_for``.
+
 Proposal contract (consumed by ``sandbox._apply`` and ``tools._apply_*``):
 
     read            {"kind": "read", "data": {...}}
@@ -18,14 +25,17 @@ Proposal contract (consumed by ``sandbox._apply`` and ``tools._apply_*``):
                      "amount": float, "po_id": str, "invoice_id": str}
     audit_note      {"kind": "audit_note", "event_type": str, "payload": dict}
 
-Proposals carry inputs only - never generated IDs, timestamps or derived
-status - so the sandbox's proposal and the control plane's re-decision compare
-equal.
+Mutation proposals (``transition``, ``create_approval``, ``audit_note``) carry
+inputs only - never generated IDs, timestamps or derived status - so the
+sandbox's proposal and the control plane's re-decision compare equal. Read
+proposals carry deterministic derived data, which compares equal for the same
+reason.
 """
 
 from __future__ import annotations
 
 import math
+from datetime import date
 from typing import Any, Dict, Tuple
 
 CONTRACT_VERSION = "1.0.0"
@@ -41,6 +51,7 @@ AMOUNT_TOLERANCE = 0.01
 PROPOSAL_KINDS: Dict[str, Tuple[str, ...]] = {
     "lookup_vendor": ("read",),
     "get_invoice": ("read",),
+    "get_invoice_aging": ("read",),
     "run_three_way_match": ("transition",),
     "request_payout_approval": ("create_approval",),
     "log_audit_event": ("audit_note",),
@@ -64,6 +75,22 @@ def _is_number(value: Any) -> bool:
 
 def _nonempty_str(value: Any) -> bool:
     return isinstance(value, str) and bool(value)
+
+
+def _aging_bucket(days_outstanding: int) -> str:
+    """Map days past due to a standard AP aging bucket.
+
+    ``days_outstanding`` is negative when the invoice is not yet due.
+    """
+    if days_outstanding <= 0:
+        return "CURRENT"
+    if days_outstanding <= 30:
+        return "1-30"
+    if days_outstanding <= 60:
+        return "31-60"
+    if days_outstanding <= 90:
+        return "61-90"
+    return "90+"
 
 
 # ---------------------------------------------------------------------------
@@ -93,6 +120,60 @@ def _decide_get_invoice(
     if invoice is None:
         return _error("INVOICE_NOT_FOUND", invoice_id)
     return _proposal({"kind": "read", "data": {"invoice": dict(invoice)}})
+
+
+def _decide_get_invoice_aging(
+    arguments: Dict[str, Any], snapshot: Dict[str, Any]
+) -> Dict[str, Any]:
+    invoice_id = arguments.get("invoice_id")
+    if not _nonempty_str(invoice_id):
+        return _error("INVALID_ARGUMENTS", "invoice_id must be a non-empty string")
+
+    as_of = arguments.get("as_of", "")
+    if as_of is None:
+        as_of = ""
+    if not isinstance(as_of, str):
+        return _error("INVALID_ARGUMENTS", "as_of must be a string")
+    as_of = as_of.strip()
+
+    invoice = snapshot.get("invoices", {}).get(invoice_id)
+    if invoice is None:
+        return _error("INVOICE_NOT_FOUND", invoice_id)
+
+    # Resolve the reference date without reading the clock: an explicit
+    # ``as_of`` wins, otherwise fall back to the date the control plane froze
+    # into the snapshot.
+    reference = as_of or snapshot.get("as_of", "")
+    if not _nonempty_str(reference):
+        return _error("INVALID_SNAPSHOT", "snapshot is missing as_of")
+    try:
+        reference_date = date.fromisoformat(reference)
+    except ValueError:
+        return _error("INVALID_ARGUMENTS", f"as_of is not an ISO date: {reference}")
+
+    due = invoice.get("due_date")
+    if not _nonempty_str(due):
+        return _error("AGING_UNAVAILABLE", f"invoice {invoice_id} has no due_date")
+    try:
+        due_date = date.fromisoformat(due)
+    except ValueError:
+        return _error("AGING_UNAVAILABLE", f"invoice {invoice_id} has a bad due_date")
+
+    days_outstanding = (reference_date - due_date).days
+    return _proposal(
+        {
+            "kind": "read",
+            "data": {
+                "aging": {
+                    "invoice_id": invoice_id,
+                    "as_of": reference_date.isoformat(),
+                    "due_date": due_date.isoformat(),
+                    "days_outstanding": days_outstanding,
+                    "bucket": _aging_bucket(days_outstanding),
+                }
+            },
+        }
+    )
 
 
 def _decide_run_three_way_match(
@@ -224,6 +305,7 @@ def _decide_log_audit_event(
 _DECIDERS = {
     "lookup_vendor": _decide_lookup_vendor,
     "get_invoice": _decide_get_invoice,
+    "get_invoice_aging": _decide_get_invoice_aging,
     "run_three_way_match": _decide_run_three_way_match,
     "request_payout_approval": _decide_request_payout_approval,
     "log_audit_event": _decide_log_audit_event,
