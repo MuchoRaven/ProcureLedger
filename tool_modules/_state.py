@@ -26,6 +26,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -48,6 +49,23 @@ REQ_STATUS_OPEN = "OPEN"
 REQ_STATUS_CONVERTED = "CONVERTED"
 REQ_STATUS_CANCELLED = "CANCELLED"
 
+RFQ_STATUS_OPEN = "OPEN"
+RFQ_STATUS_AWARDED = "AWARDED"
+RFQ_STATUS_CANCELLED = "CANCELLED"
+
+QUOTE_STATUS_RECEIVED = "RECEIVED"
+QUOTE_STATUS_AWARDED = "AWARDED"
+QUOTE_STATUS_REJECTED = "REJECTED"
+
+EXCEPTION_STATUS_OPEN = "OPEN"
+EXCEPTION_STATUS_RESOLVED = "RESOLVED"
+
+# Duplicate-invoice detection window. Two invoices from the same vendor, for
+# the same amount, against the same PO, inside this many days of each other are
+# treated as a suspected duplicate. Kept here rather than in ``tools`` so the
+# detector and any test that asserts on the window read one value.
+DUPLICATE_WINDOW_DAYS = 30
+
 # Event types the model must not be able to forge via ``log_audit_event``.
 # These are written by the control plane (``source="tool"``) only.
 _RESERVED_EVENT_TYPES = frozenset(
@@ -64,6 +82,20 @@ _RESERVED_EVENT_TYPES = frozenset(
         "THREE_WAY_MATCH",
         "TOOL_CALL_STARTED",
         "TOOL_CALL_COMPLETED",
+        # Sourcing: RFQ -> quote -> award.
+        "RFQ_CREATED",
+        "RFQ_STATUS_CHANGED",
+        "QUOTE_RECEIVED",
+        "QUOTE_AWARDED",
+        # Follow-up. Written by the maintenance pass, never by the model.
+        "PO_LATE",
+        "DELAY_NOTIFIED",
+        "PAYMENT_DUE",
+        "PAYMENT_REMINDER_SENT",
+        # Exception workflow. ``EXCEPTION_OPENED`` is written by the detector
+        # and by the match path; ``EXCEPTION_RESOLVED`` by the operator tool.
+        "EXCEPTION_OPENED",
+        "EXCEPTION_RESOLVED",
         # Written by ``_handle_unrecoverable_audit`` when a corrupt chain is
         # quarantined. Reserved so the model cannot forge a reset.
         "CHAIN_RESET",
@@ -121,6 +153,9 @@ _RECEIPTS: Dict[str, Dict[str, Any]] = {}
 _INVOICES: Dict[str, Dict[str, Any]] = {}
 _APPROVALS: Dict[str, Dict[str, Any]] = {}
 _REQUISITIONS: Dict[str, Dict[str, Any]] = {}
+_RFQS: Dict[str, Dict[str, Any]] = {}
+_QUOTES: Dict[str, Dict[str, Any]] = {}
+_EXCEPTIONS: Dict[str, Dict[str, Any]] = {}
 
 _AUDIT: List[Dict[str, Any]] = []
 _AUDIT_SEQ: int = 0
@@ -133,6 +168,39 @@ _AUDIT_SEQ: int = 0
 def _now() -> str:
     """Return the current UTC time as an ISO-8601 string."""
     return datetime.now(timezone.utc).isoformat()
+
+
+def _today() -> str:
+    """Return the current UTC date as ``YYYY-MM-DD``.
+
+    Follow-up work (late POs, due payments) is date-granular, so the reference
+    date is a plain ISO date rather than a timestamp. Callers that need a
+    deterministic result pass ``as_of`` explicitly.
+    """
+    return datetime.now(timezone.utc).date().isoformat()
+
+
+# ---------------------------------------------------------------------------
+# Payment terms
+# ---------------------------------------------------------------------------
+
+_TERMS_RE = re.compile(r"^NET\s*(\d+)$", re.IGNORECASE)
+
+
+def _payment_terms_days(terms: Optional[str]) -> Optional[int]:
+    """Parse a ``NETnn`` payment term into a day count.
+
+    Returns ``None`` for an unrecognised term rather than guessing, so a caller
+    can distinguish "due on receipt" (``NET0``) from "we do not know". The
+    previous behaviour of defaulting to 30 silently invented a due date for
+    every vendor with a malformed term.
+    """
+    if not terms:
+        return None
+    match = _TERMS_RE.match(str(terms).strip())
+    if match is None:
+        return None
+    return int(match.group(1))
 
 
 # ---------------------------------------------------------------------------
@@ -368,6 +436,21 @@ _ENTITIES: Dict[str, _EntitySpec] = {
         id_field="requisition_id",
         not_found_code="REQUISITION_NOT_FOUND",
     ),
+    "rfq": _EntitySpec(
+        store=lambda: _RFQS,
+        id_field="rfq_id",
+        not_found_code="RFQ_NOT_FOUND",
+    ),
+    "quote": _EntitySpec(
+        store=lambda: _QUOTES,
+        id_field="quote_id",
+        not_found_code="QUOTE_NOT_FOUND",
+    ),
+    "exception": _EntitySpec(
+        store=lambda: _EXCEPTIONS,
+        id_field="exception_id",
+        not_found_code="EXCEPTION_NOT_FOUND",
+    ),
 }
 
 
@@ -387,9 +470,10 @@ def _check_entity_transition(
 ) -> None:
     """Validate a transition for any registered entity without changing it.
 
-    One implementation for invoices, POs and requisitions. The previous
-    invoice-only helper forced ``tools._apply_transition`` to re-implement the
-    same checks for the other two record types, and the copies could drift.
+    One implementation for invoices, POs, requisitions, RFQs, quotes and
+    exceptions. The previous invoice-only helper forced
+    ``tools._apply_transition`` to re-implement the same checks for the other
+    record types, and the copies could drift.
 
     Raises ``ToolError`` on an unknown entity or record, or an illegal
     transition. Split out from ``_transition_entity`` so ``_commit`` can reject
@@ -632,6 +716,49 @@ def _seed_state() -> None:
             },
         }
     )
+    _RFQS.update(
+        {
+            "RFQ-5001": {
+                "rfq_id": "RFQ-5001",
+                "description": "Hydraulic fittings, Q2 restock",
+                "quantity": 120,
+                "currency": "USD",
+                "status": RFQ_STATUS_OPEN,
+                "awarded_quote_id": None,
+                "created_at": _now(),
+                "updated_at": _now(),
+            },
+        }
+    )
+    _QUOTES.update(
+        {
+            "QUO-6001": {
+                "quote_id": "QUO-6001",
+                "rfq_id": "RFQ-5001",
+                "vendor_id": "VEND-001",
+                "amount": 14400.00,
+                "currency": "USD",
+                "lead_time_days": 7,
+                "status": QUOTE_STATUS_RECEIVED,
+                "created_at": _now(),
+                "updated_at": _now(),
+            },
+            "QUO-6002": {
+                "quote_id": "QUO-6002",
+                "rfq_id": "RFQ-5001",
+                "vendor_id": "VEND-002",
+                "amount": 13800.00,
+                "currency": "USD",
+                "lead_time_days": 14,
+                "status": QUOTE_STATUS_RECEIVED,
+                "created_at": _now(),
+                "updated_at": _now(),
+            },
+        }
+    )
+    # ``_EXCEPTIONS`` is deliberately empty: exceptions are opened by the
+    # detector and the match path, so seeding one would make a fresh install
+    # look like it already had an unresolved problem.
 
 
 # ---------------------------------------------------------------------------
@@ -731,6 +858,9 @@ def _reset_state() -> None:
         _INVOICES.clear()
         _APPROVALS.clear()
         _REQUISITIONS.clear()
+        _RFQS.clear()
+        _QUOTES.clear()
+        _EXCEPTIONS.clear()
         _AUDIT = []
         _AUDIT_SEQ = 0
         _truncate_audit_log()
