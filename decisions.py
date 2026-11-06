@@ -24,12 +24,29 @@ Proposal contract (consumed by ``sandbox._apply`` and ``tools._apply_*``):
     create_approval {"kind": "create_approval", "vendor_id": str,
                      "amount": float, "po_id": str, "invoice_id": str}
     audit_note      {"kind": "audit_note", "event_type": str, "payload": dict}
+    create_po       {"kind": "create_po", "vendor_id": str, "amount": float,
+                     "currency": str, "expected_delivery": str,
+                     "requisition_id": str | None}
+    record_receipt  {"kind": "record_receipt", "po_id": str, "amount": float}
 
-Mutation proposals (``transition``, ``create_approval``, ``audit_note``) carry
-inputs only - never generated IDs, timestamps or derived status - so the
-sandbox's proposal and the control plane's re-decision compare equal. Read
-proposals carry deterministic derived data, which compares equal for the same
-reason.
+Mutation proposals (``transition``, ``create_approval``, ``audit_note``,
+``create_po``, ``record_receipt``) carry inputs only - never generated IDs,
+timestamps or derived status - so the sandbox's proposal and the control
+plane's re-decision compare equal. Read proposals carry deterministic derived
+data, which compares equal for the same reason.
+
+Registration
+------------
+Every tool needs two entries:
+
+* ``PROPOSAL_KINDS[tool]`` - the proposal kinds the tool may emit. This is
+  also the agent's allowlist (``agent.ALLOWED_TOOLS``), so a tool listed here
+  is a name the model may attempt.
+* ``SNAPSHOT_SCOPES[tool]`` - the selector keys the tool reads from its
+  arguments. ``sandbox._snapshot`` forwards only these to
+  ``tools._snapshot_for``; everything else is business data, not a selector.
+
+The two tables are checked for key equality at import so they cannot drift.
 """
 
 from __future__ import annotations
@@ -55,10 +72,38 @@ PROPOSAL_KINDS: Dict[str, Tuple[str, ...]] = {
     "run_three_way_match": ("transition",),
     "request_payout_approval": ("create_approval",),
     "log_audit_event": ("audit_note",),
+    "create_po": ("create_po",),
+    "record_goods_receipt": ("record_receipt",),
 }
 
-# Tools the sandbox accepts at all. Derived so the two tables cannot drift.
-SNAPSHOT_SCOPES: Tuple[str, ...] = tuple(PROPOSAL_KINDS)
+# Tool -> selector keys the tool reads from its arguments. ``sandbox._snapshot``
+# forwards only these to ``tools._snapshot_for``; every other argument is
+# business data. ``as_of`` is not an ID but is a selector for the aging
+# decider, so it is listed where it is read.
+#
+# This is a dict, not a tuple: ``sandbox.dispatch`` only does
+# ``if tool not in decisions.SNAPSHOT_SCOPES``, and ``in`` on a dict tests
+# keys, so that call site is unchanged.
+SNAPSHOT_SCOPES: Dict[str, Tuple[str, ...]] = {
+    "lookup_vendor": ("vendor_id",),
+    "get_invoice": ("invoice_id",),
+    "get_invoice_aging": ("invoice_id", "as_of"),
+    "run_three_way_match": ("invoice_id", "po_id"),
+    "request_payout_approval": ("vendor_id", "po_id", "invoice_id"),
+    "log_audit_event": (),
+    "create_po": ("vendor_id", "requisition_id"),
+    "record_goods_receipt": ("po_id",),
+}
+
+# Guard against drift: every tool in ``PROPOSAL_KINDS`` must declare its
+# selector keys here, and vice versa. A mismatch is a programming error, so
+# fail at import rather than at the first tool call.
+if set(SNAPSHOT_SCOPES) != set(PROPOSAL_KINDS):
+    raise RuntimeError(
+        "SNAPSHOT_SCOPES and PROPOSAL_KINDS disagree: "
+        f"only in PROPOSAL_KINDS={sorted(set(PROPOSAL_KINDS) - set(SNAPSHOT_SCOPES))}, "
+        f"only in SNAPSHOT_SCOPES={sorted(set(SNAPSHOT_SCOPES) - set(PROPOSAL_KINDS))}"
+    )
 
 
 def _error(code: str, detail: str = "") -> Dict[str, Any]:
@@ -71,6 +116,13 @@ def _proposal(proposal: Dict[str, Any]) -> Dict[str, Any]:
 
 def _is_number(value: Any) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _as_float(value: Any) -> float:
+    """Coerce a numeric field to float, treating anything else as 0.0."""
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    return 0.0
 
 
 def _nonempty_str(value: Any) -> bool:
@@ -302,6 +354,124 @@ def _decide_log_audit_event(
     )
 
 
+def _decide_create_po(
+    arguments: Dict[str, Any], snapshot: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Validate a PO-creation request and emit a ``create_po`` proposal.
+
+    Mirrors ``tools._check_create_po``: the vendor must exist and be ACTIVE,
+    and a linked requisition must exist and still be OPEN. The proposal carries
+    inputs only - the PO ID and timestamps are generated in
+    ``tools._apply_create_po`` - so the sandbox and the control plane compare
+    equal. ``expected_delivery`` is normalised to ISO here so the proposal is
+    canonical; ``_apply_create_po`` normalises it again, which is a no-op.
+    """
+    vendor_id = arguments.get("vendor_id")
+    amount = arguments.get("amount")
+    currency = arguments.get("currency", "USD")
+    expected_delivery = arguments.get("expected_delivery", "")
+    requisition_id = arguments.get("requisition_id") or None
+
+    if not _nonempty_str(vendor_id):
+        return _error("INVALID_ARGUMENTS", "vendor_id must be a non-empty string")
+    if not _is_number(amount) or not math.isfinite(float(amount)):
+        return _error("INVALID_AMOUNT", "amount must be a finite number")
+    if amount <= 0:
+        return _error("INVALID_AMOUNT", "amount must be greater than zero")
+    if not _nonempty_str(currency) or not currency.strip():
+        return _error("INVALID_ARGUMENTS", "currency must be a non-empty string")
+    if expected_delivery is None:
+        expected_delivery = ""
+    if not isinstance(expected_delivery, str):
+        return _error("INVALID_ARGUMENTS", "expected_delivery must be a string")
+    expected_delivery = expected_delivery.strip()
+    if expected_delivery:
+        try:
+            expected_delivery = date.fromisoformat(expected_delivery).isoformat()
+        except ValueError:
+            return _error(
+                "INVALID_ARGUMENTS", "expected_delivery is not an ISO date"
+            )
+    if requisition_id is not None and not _nonempty_str(requisition_id):
+        return _error(
+            "INVALID_ARGUMENTS", "requisition_id must be a non-empty string"
+        )
+
+    vendor = snapshot.get("vendors", {}).get(vendor_id)
+    if vendor is None:
+        return _error("VENDOR_NOT_FOUND", vendor_id)
+    if vendor.get("status") != "ACTIVE":
+        return _error("VENDOR_INACTIVE", f"{vendor_id} is {vendor.get('status')}")
+
+    if requisition_id is not None:
+        requisition = snapshot.get("requisitions", {}).get(requisition_id)
+        if requisition is None:
+            return _error("REQUISITION_NOT_FOUND", requisition_id)
+        if requisition.get("status") != "OPEN":
+            return _error(
+                "REQUISITION_NOT_OPEN",
+                f"{requisition_id} is {requisition.get('status')}",
+            )
+
+    return _proposal(
+        {
+            "kind": "create_po",
+            "vendor_id": vendor_id,
+            "amount": float(amount),
+            "currency": currency.strip(),
+            "expected_delivery": expected_delivery,
+            "requisition_id": requisition_id,
+        }
+    )
+
+
+def _decide_record_goods_receipt(
+    arguments: Dict[str, Any], snapshot: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Validate a goods-receipt request and emit a ``record_receipt`` proposal.
+
+    Mirrors ``tools._check_record_receipt``: the PO must exist and be OPEN, and
+    the cumulative received amount (existing receipts plus this one) must not
+    exceed the PO amount beyond ``AMOUNT_TOLERANCE``. The over-receipt check is
+    only possible because ``tools._snapshot_for`` pulls a PO's receipts into
+    the snapshot alongside the PO itself. The proposal carries inputs only -
+    the receipt ID and timestamp are generated in
+    ``tools._apply_record_receipt``.
+    """
+    po_id = arguments.get("po_id")
+    amount = arguments.get("amount")
+
+    if not _nonempty_str(po_id):
+        return _error("INVALID_ARGUMENTS", "po_id must be a non-empty string")
+    if not _is_number(amount) or not math.isfinite(float(amount)):
+        return _error("INVALID_AMOUNT", "amount must be a finite number")
+    if amount <= 0:
+        return _error("INVALID_AMOUNT", "amount must be greater than zero")
+
+    po = snapshot.get("pos", {}).get(po_id)
+    if po is None:
+        return _error("PO_NOT_FOUND", po_id)
+    if po.get("status") != "OPEN":
+        return _error("PO_NOT_OPEN", f"{po_id} is {po.get('status')}")
+
+    received = sum(
+        _as_float(receipt.get("amount"))
+        for receipt in snapshot.get("receipts", {}).values()
+        if receipt.get("po_id") == po_id
+    )
+    po_amount = _as_float(po.get("amount"))
+    if received + float(amount) > po_amount + AMOUNT_TOLERANCE:
+        return _error(
+            "RECEIPT_EXCEEDS_PO",
+            f"po {po_id} amount {po_amount}, received {received}, "
+            f"requested {float(amount)}",
+        )
+
+    return _proposal(
+        {"kind": "record_receipt", "po_id": po_id, "amount": float(amount)}
+    )
+
+
 _DECIDERS = {
     "lookup_vendor": _decide_lookup_vendor,
     "get_invoice": _decide_get_invoice,
@@ -309,6 +479,8 @@ _DECIDERS = {
     "run_three_way_match": _decide_run_three_way_match,
     "request_payout_approval": _decide_request_payout_approval,
     "log_audit_event": _decide_log_audit_event,
+    "create_po": _decide_create_po,
+    "record_goods_receipt": _decide_record_goods_receipt,
 }
 
 
