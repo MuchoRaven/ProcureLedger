@@ -12,6 +12,8 @@ sandbox's internals:
 * The agent allowlist and ``decisions.PROPOSAL_KINDS`` cannot drift.
 * ``decisions.AMOUNT_TOLERANCE`` and ``tools.AMOUNT_TOLERANCE`` cannot drift.
 * A failed audit write leaves business state unchanged (audit-before-mutation).
+* The authenticated principal is threaded into the sandbox, never taken from
+  the model's tool arguments.
 
 The end-to-end tests need ``bwrap`` and ``prlimit`` on the host and are skipped
 otherwise. Enforcing their presence in a deployment is the job of
@@ -61,6 +63,49 @@ def test_dispatch_tool_rejects_non_allowlisted(clean_state):
     )
     assert result["ok"] is False
     assert result["error"] == "TOOL_NOT_ALLOWED"
+
+
+def test_dispatch_tool_forwards_principal_and_strips_model_args(
+    clean_state, monkeypatch
+):
+    """The principal comes from the HTTP layer, never from the model's args.
+
+    ``dispatch_tool`` must forward the authenticated ``Principal`` and the
+    loop's ``correlation_id`` to ``sandbox.dispatch``, and must drop any
+    ``principal``/``correlation_id`` the model put in its tool arguments so a
+    prompt-injected call cannot impersonate a caller or forge a trace ID.
+    """
+    captured = {}
+
+    def fake_dispatch(tool, arguments, principal=None, correlation_id=""):
+        captured["tool"] = tool
+        captured["arguments"] = arguments
+        captured["principal"] = principal
+        captured["correlation_id"] = correlation_id
+        return {"ok": True, "invoice": {"invoice_id": "INV-2001"}}
+
+    monkeypatch.setattr(sandbox, "dispatch", fake_dispatch)
+
+    principal = tools.Principal(sub="agent", roles=frozenset({"agent"}))
+    result = agent.dispatch_tool(
+        "get_invoice",
+        {
+            "invoice_id": "INV-2001",
+            "principal": "attacker",
+            "correlation_id": "attacker-cid",
+        },
+        "cid-real",
+        principal,
+    )
+
+    assert result["ok"] is True
+    assert captured["tool"] == "get_invoice"
+    # Identity, not equality: the exact object from the HTTP layer is forwarded.
+    assert captured["principal"] is principal
+    # The loop's correlation ID wins over the model-supplied one.
+    assert captured["correlation_id"] == "cid-real"
+    # The model's principal/correlation_id never reach the sandbox.
+    assert captured["arguments"] == {"invoice_id": "INV-2001"}
 
 
 @requires_sandbox
