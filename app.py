@@ -10,25 +10,29 @@ payout on its own. ``/audit`` and ``/audit/verify`` read the on-disk chain.
 Authentication
 --------------
 Every endpoint except ``/health`` requires ``Authorization: Bearer <token>``.
-Two credentials exist and they are not interchangeable:
+Three credentials exist and they are not interchangeable:
 
 * ``PL_AGENT_TOKEN``    - role ``agent``.    ``/agent/run``.
-* ``PL_OPERATOR_TOKEN`` - role ``operator``. Invoice ingest, approval, payout.
+* ``PL_OPERATOR_TOKEN`` - role ``operator``. Invoice ingest and approval.
+* ``PL_EXECUTOR_TOKEN`` - role ``executor``. Payout settlement.
 
 The split is the point: the human-approval gate is meaningless if the agent's
-own credential can reach ``/approvals/{id}/approve``. Tokens are compared with
-``hmac.compare_digest`` against every candidate, so a wrong token does not leak
-which prefix matched.
+own credential can reach ``/approvals/{id}/approve``, and separation of duties
+is meaningless if the approver's credential can also settle. Tokens are
+compared with ``hmac.compare_digest`` against every candidate, so a wrong token
+does not leak which prefix matched.
 
-``preflight_auth`` runs in the lifespan hook and refuses to boot if either
-token is unset or if the two are equal - a deployment that forgot to configure
-them must not come up wide open, and an equal pair would silently promote the
-agent credential to operator.
+``preflight_auth`` runs in the lifespan hook and refuses to boot if any token
+is unset or if any two are equal - a deployment that forgot to configure them
+must not come up wide open, and an equal pair would silently collapse two roles
+into one.
 
-The approver recorded on ``/approvals/{id}/approve`` is
-``config.PL_OPERATOR_NAME``, not the request body. A body ``approver`` that
-disagrees is rejected with 403 rather than silently ignored, so a caller
-cannot believe it approved as someone else.
+The approver recorded on ``/approvals/{id}/approve`` is the authenticated
+operator's ``sub``, not the request body. A body ``approver`` that disagrees is
+rejected with 403 rather than silently ignored, so a caller cannot believe it
+approved as someone else. The executor recorded on
+``/approvals/{id}/execute`` is the authenticated executor's ``sub``, and
+``tools._execute_payout`` refuses when it equals the approver.
 
 Error contract
 --------------
@@ -91,6 +95,7 @@ import tools
 
 ROLE_AGENT = "agent"
 ROLE_OPERATOR = "operator"
+ROLE_EXECUTOR = "executor"
 
 
 class AuthError(Exception):
@@ -102,20 +107,32 @@ class AuthError(Exception):
         self.detail = detail
 
 
-def _principals() -> Dict[str, str]:
-    """Map token -> role.
+def _principals() -> Dict[str, tools.Principal]:
+    """Map token -> Principal.
 
     Rebuilt per call rather than cached at import so a test can monkeypatch
     ``config`` without reloading the module. Empty tokens are omitted, which is
     why ``preflight_auth`` must run before the app serves traffic.
     """
-    table: Dict[str, str] = {}
+    table: Dict[str, tools.Principal] = {}
     agent_token = (config.PL_AGENT_TOKEN or "").strip()
     operator_token = (config.PL_OPERATOR_TOKEN or "").strip()
+    executor_token = (config.PL_EXECUTOR_TOKEN or "").strip()
+
     if agent_token:
-        table[agent_token] = ROLE_AGENT
+        table[agent_token] = tools.Principal(
+            sub="agent", roles=frozenset({ROLE_AGENT})
+        )
     if operator_token:
-        table[operator_token] = ROLE_OPERATOR
+        name = (config.PL_OPERATOR_NAME or "operator").strip() or "operator"
+        table[operator_token] = tools.Principal(
+            sub=name, roles=frozenset({ROLE_OPERATOR})
+        )
+    if executor_token:
+        name = (config.PL_EXECUTOR_NAME or "executor").strip() or "executor"
+        table[executor_token] = tools.Principal(
+            sub=name, roles=frozenset({ROLE_EXECUTOR})
+        )
     return table
 
 
@@ -123,38 +140,40 @@ def preflight_auth() -> None:
     """Fail fast if the deployment has no usable credentials.
 
     Mirrors ``sandbox.preflight``: a host that cannot authenticate must fail at
-    boot, not serve every request as an anonymous 401. The equality check
-    matters because ``_principals`` is a dict - an identical pair would let the
-    operator entry overwrite the agent entry, silently granting the agent
-    credential operator rights.
+    boot, not serve every request as an anonymous 401. The pairwise equality
+    check matters because ``_principals`` is a dict - an identical pair would
+    let one entry overwrite another, silently collapsing two roles into one.
     """
     agent_token = (config.PL_AGENT_TOKEN or "").strip()
     operator_token = (config.PL_OPERATOR_TOKEN or "").strip()
+    executor_token = (config.PL_EXECUTOR_TOKEN or "").strip()
 
-    missing = [
-        name
-        for name, value in (
-            ("PL_AGENT_TOKEN", agent_token),
-            ("PL_OPERATOR_TOKEN", operator_token),
-        )
-        if not value
+    pairs = [
+        ("PL_AGENT_TOKEN", agent_token),
+        ("PL_OPERATOR_TOKEN", operator_token),
+        ("PL_EXECUTOR_TOKEN", executor_token),
     ]
+    missing = [name for name, value in pairs if not value]
     if missing:
         raise RuntimeError(
             "authentication unavailable: missing " + ", ".join(missing)
         )
-    if hmac.compare_digest(agent_token, operator_token):
-        raise RuntimeError(
-            "PL_AGENT_TOKEN and PL_OPERATOR_TOKEN must differ; "
-            "an identical pair would grant the agent operator rights"
-        )
+    for i in range(len(pairs)):
+        for j in range(i + 1, len(pairs)):
+            if hmac.compare_digest(pairs[i][1], pairs[j][1]):
+                raise RuntimeError(
+                    f"{pairs[i][0]} and {pairs[j][0]} must differ; "
+                    "an identical pair would collapse two roles into one"
+                )
 
 
-def _authenticate(authorization: Optional[str]) -> str:
-    """Resolve a bearer token to a role, or raise ``AuthError``.
+def _authenticate(authorization: Optional[str]) -> tools.Principal:
+    """Resolve a bearer token to a Principal, or raise ``AuthError``.
 
     Every candidate is compared, with no early exit, so the response time does
-    not reveal how much of a guessed token was correct.
+    not reveal how much of a guessed token was correct. Both sides are encoded
+    to bytes because ``hmac.compare_digest`` raises ``TypeError`` on non-ASCII
+    ``str``.
     """
     if not authorization or not authorization.strip():
         raise AuthError("AUTH_MISSING", "Authorization header is required")
@@ -163,11 +182,11 @@ def _authenticate(authorization: Optional[str]) -> str:
     if scheme.strip().lower() != "bearer" or not token.strip():
         raise AuthError("AUTH_INVALID", "expected 'Authorization: Bearer <token>'")
 
-    token = token.strip()
-    matched: Optional[str] = None
-    for candidate, role in _principals().items():
-        if hmac.compare_digest(candidate, token):
-            matched = role
+    token_bytes = token.strip().encode("utf-8")
+    matched: Optional[tools.Principal] = None
+    for candidate, principal in _principals().items():
+        if hmac.compare_digest(candidate.encode("utf-8"), token_bytes):
+            matched = principal
 
     if matched is None:
         raise AuthError("AUTH_INVALID", "token not recognised")
@@ -176,30 +195,42 @@ def _authenticate(authorization: Optional[str]) -> str:
 
 def require_agent(
     authorization: Optional[str] = Header(default=None, alias="Authorization"),
-) -> str:
+) -> tools.Principal:
     """Allow only the agent credential."""
-    role = _authenticate(authorization)
-    if role != ROLE_AGENT:
+    principal = _authenticate(authorization)
+    if not principal.has_role(ROLE_AGENT):
         raise AuthError("AUTH_FORBIDDEN", "this endpoint requires the agent credential")
-    return role
+    return principal
 
 
 def require_operator(
     authorization: Optional[str] = Header(default=None, alias="Authorization"),
-) -> str:
+) -> tools.Principal:
     """Allow only the operator credential."""
-    role = _authenticate(authorization)
-    if role != ROLE_OPERATOR:
+    principal = _authenticate(authorization)
+    if not principal.has_role(ROLE_OPERATOR):
         raise AuthError(
             "AUTH_FORBIDDEN", "this endpoint requires the operator credential"
         )
-    return role
+    return principal
+
+
+def require_executor(
+    authorization: Optional[str] = Header(default=None, alias="Authorization"),
+) -> tools.Principal:
+    """Allow only the executor credential."""
+    principal = _authenticate(authorization)
+    if not principal.has_role(ROLE_EXECUTOR):
+        raise AuthError(
+            "AUTH_FORBIDDEN", "this endpoint requires the executor credential"
+        )
+    return principal
 
 
 def require_any(
     authorization: Optional[str] = Header(default=None, alias="Authorization"),
-) -> str:
-    """Allow either credential. Used for read-only endpoints."""
+) -> tools.Principal:
+    """Allow any credential. Used for read-only endpoints."""
     return _authenticate(authorization)
 
 
@@ -302,6 +333,7 @@ _TOOL_ERROR_STATUS = {
     "APPROVAL_NOT_PENDING": 409,
     "APPROVAL_NOT_APPROVED": 409,
     "APPROVAL_ALREADY_PENDING": 409,
+    "SEPARATION_OF_DUTIES": 409,
     "VENDOR_INACTIVE": 409,
     "VENDOR_HIGH_RISK": 409,
     "VENDOR_MISMATCH": 409,
@@ -512,11 +544,13 @@ def health() -> Dict[str, Any]:
 def run_agent(
     req: RunRequest,
     cid: str = Depends(correlation_id_header),
-    _role: str = Depends(require_agent),
+    principal: tools.Principal = Depends(require_agent),
 ) -> Any:
     correlation_id = _resolve_correlation_id(cid, req.correlation_id)
     try:
-        result = agent.run(req.message, correlation_id=correlation_id)
+        result = agent.run(
+            req.message, correlation_id=correlation_id, principal=principal
+        )
     except RuntimeError as exc:
         # Defensive: agent.run reports failures in-band, but a client-init
         # failure must still surface as a 5xx rather than a silent 200.
@@ -543,7 +577,7 @@ def read_audit(
     limit: int = 100,
     offset: int = 0,
     cid: str = Depends(correlation_id_header),
-    _role: str = Depends(require_any),
+    principal: tools.Principal = Depends(require_any),
 ) -> Dict[str, Any]:
     """Return a page of the durable audit chain.
 
@@ -577,7 +611,7 @@ def read_audit(
 def verify_audit(
     from_file: bool = True,
     cid: str = Depends(correlation_id_header),
-    _role: str = Depends(require_any),
+    principal: tools.Principal = Depends(require_any),
 ) -> Dict[str, Any]:
     """Re-verify the chain.
 
@@ -596,7 +630,7 @@ def verify_audit(
 def get_invoice(
     invoice_id: str,
     cid: str = Depends(correlation_id_header),
-    _role: str = Depends(require_any),
+    principal: tools.Principal = Depends(require_any),
 ) -> Any:
     return _respond(tools.get_invoice(invoice_id), cid)
 
@@ -605,7 +639,7 @@ def get_invoice(
 def ingest_invoice(
     req: IngestRequest,
     cid: str = Depends(correlation_id_header),
-    _role: str = Depends(require_operator),
+    principal: tools.Principal = Depends(require_operator),
 ) -> Any:
     correlation_id = _resolve_correlation_id(cid, req.correlation_id)
     return _respond(
@@ -625,7 +659,7 @@ def ingest_invoice(
 def get_approval(
     approval_id: str,
     cid: str = Depends(correlation_id_header),
-    _role: str = Depends(require_any),
+    principal: tools.Principal = Depends(require_any),
 ) -> Any:
     return _respond(tools.get_approval(approval_id), cid)
 
@@ -635,7 +669,7 @@ def approve(
     approval_id: str,
     req: ApproveRequest,
     cid: str = Depends(correlation_id_header),
-    _role: str = Depends(require_operator),
+    principal: tools.Principal = Depends(require_operator),
 ) -> Any:
     """Record a human approval decision. Does NOT move money.
 
@@ -644,7 +678,7 @@ def approve(
     believe it approved under someone else's name.
     """
     correlation_id = _resolve_correlation_id(cid, req.correlation_id)
-    identity = (config.PL_OPERATOR_NAME or "operator").strip() or "operator"
+    identity = principal.sub
 
     claimed = (req.approver or "").strip()
     if claimed and claimed != identity:
@@ -664,11 +698,17 @@ def execute(
     approval_id: str,
     req: ExecuteRequest,
     cid: str = Depends(correlation_id_header),
-    _role: str = Depends(require_operator),
+    principal: tools.Principal = Depends(require_executor),
 ) -> Any:
-    """Settle an approved payout. Operator-only, never reachable by the model."""
+    """Settle an approved payout. Executor-only, never reachable by the model.
+
+    Separation of duties is enforced in ``tools._execute_payout`` under the
+    state lock, so a direct caller cannot bypass it.
+    """
     correlation_id = _resolve_correlation_id(cid, req.correlation_id)
     return _respond(
-        tools._execute_payout(approval_id, correlation_id=correlation_id),
+        tools._execute_payout(
+            approval_id, principal.sub, correlation_id=correlation_id
+        ),
         correlation_id,
     )

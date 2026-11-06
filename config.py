@@ -31,22 +31,26 @@ SANDBOX_LIMITS = {
 # Authentication
 # ---------------------------------------------------------------------------
 #
-# Two credentials, deliberately not interchangeable. ``PL_AGENT_TOKEN`` reaches
-# ``/agent/run``; ``PL_OPERATOR_TOKEN`` reaches invoice ingest, approval and
-# payout settlement. The split is what makes the human-approval gate real: if
-# one token reached both, the agent could approve its own payout request.
+# Three credentials, deliberately not interchangeable. ``PL_AGENT_TOKEN``
+# reaches ``/agent/run``; ``PL_OPERATOR_TOKEN`` reaches invoice ingest and
+# approval; ``PL_EXECUTOR_TOKEN`` reaches payout settlement. The split is what
+# makes the human-approval gate real: if one token reached both, the agent
+# could approve its own payout request, and the same operator could approve and
+# settle.
 #
-# ``app.preflight_auth`` refuses to boot if either is unset, or if the two are
-# equal - an equal pair would silently promote the agent credential to
-# operator. Empty defaults are therefore safe: they fail closed at startup
-# rather than opening the service.
+# ``app.preflight_auth`` refuses to boot if any is unset, or if any two are
+# equal - an equal pair would silently collapse two roles into one. Empty
+# defaults are therefore safe: they fail closed at startup rather than opening
+# the service.
 PL_AGENT_TOKEN = os.environ.get("PL_AGENT_TOKEN", "")
 PL_OPERATOR_TOKEN = os.environ.get("PL_OPERATOR_TOKEN", "")
+PL_EXECUTOR_TOKEN = os.environ.get("PL_EXECUTOR_TOKEN", "")
 
-# Identity recorded as the approver on ``/approvals/{id}/approve``. The token
-# authorises the call; this names the human behind it, so the audit trail does
-# not read "operator" for every approver in the organisation.
+# Identity recorded as the approver / executor. The token authorises the call;
+# these name the human behind it, so the audit trail does not read "operator"
+# for every approver in the organisation.
 PL_OPERATOR_NAME = os.environ.get("PL_OPERATOR_NAME", "operator")
+PL_EXECUTOR_NAME = os.environ.get("PL_EXECUTOR_NAME", "executor")
 
 # When true, 5xx responses carry the internal ``detail`` string. Off by
 # default: ``tools`` puts raw ``OSError`` text in ``ToolError.detail``, and

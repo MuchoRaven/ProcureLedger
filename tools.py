@@ -29,15 +29,21 @@ single worker (``uvicorn ... --workers 1``); the audit chain is process-local.
 ``<AUDIT_LOG_PATH>.lock`` so a second worker fails at boot instead of forking
 the chain.
 
-Persistence
------------
+Persistence and replay
+----------------------
 ``config.AUDIT_LOG_PATH`` (``audit_log.jsonl``) is the source of truth for the
 audit chain. Every link is appended as one canonical JSON object per line and
 ``fsync``-ed before the tool call returns. On import, ``_recover_audit_state``
-loads that file back into memory so a restarted process continues the same
-chain instead of forking it. ``verify_audit_chain`` re-verifies the on-disk
-chain by default (``from_file=True``); pass ``from_file=False`` to check the
-in-memory copy instead.
+loads that file back into memory *and replays it* to rebuild ``_INVOICES`` and
+``_APPROVALS``. The chain is durable; the dicts it describes are not, so
+without replay a restart resets every invoice to ``RECEIVED`` and a paid
+invoice can be matched and paid again. Replay is at-least-once and safe
+because every transition is status-guarded: a link that would move an invoice
+backwards is skipped with a warning rather than applied.
+
+``verify_audit_chain`` re-verifies the on-disk chain by default
+(``from_file=True``); pass ``from_file=False`` to check the in-memory copy
+instead.
 
 Ordering (audit before mutation)
 --------------------------------
@@ -49,6 +55,13 @@ the call failed while the mutation is already durable and unrecorded. If the
 mutation itself raises (it should not, since callers validate first), the
 in-memory chain and the on-disk link are rolled back so memory and disk stay
 consistent.
+
+Source labelling
+----------------
+Every entry carries ``source``: ``"tool"`` for links the control plane writes,
+``"agent"`` for model reasoning notes. ``log_audit_event`` refuses the
+tool-authored event types when ``source="agent"``, so a model note cannot
+masquerade as a real approval gate or settlement in the chain.
 
 Filesystem failures
 -------------------
@@ -63,13 +76,17 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import threading
 import uuid
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, FrozenSet, List, Optional, Tuple
 
 import config
+
+_LOG = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -96,6 +113,46 @@ def _fail(code: str, detail: str = "") -> None:
     """Abort the current tool call with a structured error code."""
     raise ToolError(code, detail)
 
+
+# ---------------------------------------------------------------------------
+# Principal
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Principal:
+    """The authenticated caller.
+
+    ``sub`` is the identity recorded in the audit chain.
+    ``sandbox._build_request`` serialises ``sub``/``roles``/``auth_method`` via
+    ``getattr``, so this is the type the sandbox envelope carries. It lives
+    here rather than in ``app.py`` because ``agent.py`` already imports
+    ``tools``; importing ``app`` would be circular.
+    """
+
+    sub: str
+    roles: FrozenSet[str] = field(default_factory=frozenset)
+    auth_method: str = "bearer"
+
+    def has_role(self, role: str) -> bool:
+        return role in self.roles
+
+
+# Event types written by the tool layer. ``log_audit_event`` is model-facing, so
+# a model note must not be able to masquerade as a real gate or settlement in
+# the chain. The control plane writes these with ``source="tool"`` and bypasses
+# the reservation.
+_RESERVED_EVENT_TYPES = frozenset(
+    {
+        "INVOICE_INGESTED",
+        "THREE_WAY_MATCH",
+        "PAYOUT_APPROVAL_REQUESTED",
+        "PAYOUT_APPROVED",
+        "PAYOUT_EXECUTED",
+        "TOOL_CALL_STARTED",
+        "TOOL_CALL_COMPLETED",
+    }
+)
 
 # ---------------------------------------------------------------------------
 # State
@@ -232,7 +289,11 @@ def _canonical(obj: Any) -> str:
 
 
 def _compute_hash(entry: Dict[str, Any]) -> str:
-    """Hash the immutable fields of an audit entry (``hash`` excluded)."""
+    """Hash the immutable fields of an audit entry (``hash`` excluded).
+
+    ``source`` is included only when present, so entries written before the
+    field existed still verify. New entries always carry it.
+    """
     body = {
         "seq": entry["seq"],
         "ts": entry["ts"],
@@ -241,6 +302,8 @@ def _compute_hash(entry: Dict[str, Any]) -> str:
         "correlation_id": entry["correlation_id"],
         "prev_hash": entry["prev_hash"],
     }
+    if "source" in entry:
+        body["source"] = entry["source"]
     return hashlib.sha256(_canonical(body).encode("utf-8")).hexdigest()
 
 
@@ -315,7 +378,10 @@ def _load_audit_from_file() -> List[Dict[str, Any]]:
 
 
 def _build_audit_entry(
-    event_type: str, payload: Dict[str, Any], correlation_id: str = ""
+    event_type: str,
+    payload: Dict[str, Any],
+    correlation_id: str = "",
+    source: str = "tool",
 ) -> Dict[str, Any]:
     """Build the next audit link. Caller must hold ``_LOCK``."""
     seq = _AUDIT_SEQ + 1
@@ -330,13 +396,17 @@ def _build_audit_entry(
         "payload": payload,
         "correlation_id": correlation_id or "",
         "prev_hash": prev_hash,
+        "source": source,
     }
     entry["hash"] = _compute_hash(entry)
     return entry
 
 
 def _append_audit(
-    event_type: str, payload: Dict[str, Any], correlation_id: str = ""
+    event_type: str,
+    payload: Dict[str, Any],
+    correlation_id: str = "",
+    source: str = "agent",
 ) -> Dict[str, Any]:
     """Append one link to the hash chain and return the stored entry.
 
@@ -354,7 +424,7 @@ def _append_audit(
             # a chain that can never verify.
             _fail("AUDIT_LOG_CORRUPT", _AUDIT_RECOVERY_ERROR)
 
-        entry = _build_audit_entry(event_type, payload, correlation_id)
+        entry = _build_audit_entry(event_type, payload, correlation_id, source)
         _persist_audit(entry)
         _AUDIT.append(entry)
         _AUDIT_SEQ = entry["seq"]
@@ -366,6 +436,7 @@ def _commit(
     event_type: str,
     payload: Dict[str, Any],
     correlation_id: str = "",
+    source: str = "tool",
 ) -> Any:
     """Persist the audit link, then apply ``mutation``, atomically under ``_LOCK``.
 
@@ -381,7 +452,7 @@ def _commit(
             _fail("AUDIT_LOG_CORRUPT", _AUDIT_RECOVERY_ERROR)
 
         prev_seq = _AUDIT_SEQ
-        entry = _build_audit_entry(event_type, payload, correlation_id)
+        entry = _build_audit_entry(event_type, payload, correlation_id, source)
 
         # Snapshot the on-disk length so a failed mutation can be rolled back.
         path = config.AUDIT_LOG_PATH
@@ -416,11 +487,211 @@ def _commit(
             raise
 
 
-def _recover_audit_state() -> None:
-    """Load ``audit_log.jsonl`` into memory so appends continue the same chain.
+# ---------------------------------------------------------------------------
+# Replay
+# ---------------------------------------------------------------------------
 
-    Called once at import time. If the file cannot be parsed or read, the
-    in-memory chain is left empty and ``_AUDIT_RECOVERY_ERROR`` is set;
+
+def _reset_business_state() -> None:
+    """Restore invoices/approvals to the seed literals. Caller holds ``_LOCK``."""
+    _APPROVALS.clear()
+    for invoice_id in list(_INVOICES.keys()):
+        if invoice_id not in _SEED_INVOICE_IDS:
+            del _INVOICES[invoice_id]
+    for invoice in _INVOICES.values():
+        invoice["status"] = "RECEIVED"
+        invoice["updated_at"] = invoice["created_at"]
+
+
+def _replay_ingest(payload: Dict[str, Any], ts: str) -> None:
+    invoice_id = payload.get("invoice_id")
+    if not isinstance(invoice_id, str) or not invoice_id:
+        _fail("AUDIT_LOG_CORRUPT", "INVOICE_INGESTED missing invoice_id")
+    if invoice_id in _INVOICES:
+        return
+    vendor_id = payload.get("vendor_id")
+    po_id = payload.get("po_id")
+    amount = payload.get("amount")
+    if not isinstance(vendor_id, str) or not vendor_id:
+        _fail("AUDIT_LOG_CORRUPT", f"INVOICE_INGESTED {invoice_id} missing vendor_id")
+    if not isinstance(po_id, str) or not po_id:
+        _fail("AUDIT_LOG_CORRUPT", f"INVOICE_INGESTED {invoice_id} missing po_id")
+    if isinstance(amount, bool) or not isinstance(amount, (int, float)):
+        _fail("AUDIT_LOG_CORRUPT", f"INVOICE_INGESTED {invoice_id} bad amount")
+    _INVOICES[invoice_id] = {
+        "invoice_id": invoice_id,
+        "vendor_id": vendor_id,
+        "po_id": po_id,
+        "amount": float(amount),
+        "currency": payload.get("currency") or "USD",
+        "status": "RECEIVED",
+        "created_at": ts,
+        "updated_at": ts,
+    }
+
+
+def _replay_match(payload: Dict[str, Any], ts: str) -> None:
+    invoice_id = payload.get("invoice_id")
+    status = payload.get("status")
+    if not isinstance(invoice_id, str) or not invoice_id:
+        _fail("AUDIT_LOG_CORRUPT", "THREE_WAY_MATCH missing invoice_id")
+    if status not in ("MATCHED", "EXCEPTION"):
+        _fail("AUDIT_LOG_CORRUPT", f"THREE_WAY_MATCH {invoice_id} bad status")
+    invoice = _INVOICES.get(invoice_id)
+    if invoice is None:
+        _fail("AUDIT_LOG_CORRUPT", f"THREE_WAY_MATCH for unknown invoice {invoice_id}")
+    if invoice["status"] not in ("RECEIVED", "EXCEPTION"):
+        _LOG.warning(
+            "replay: skipping THREE_WAY_MATCH for %s; status is %s",
+            invoice_id,
+            invoice["status"],
+        )
+        return
+    invoice["status"] = status
+    invoice["updated_at"] = ts
+
+
+def _replay_approval_requested(payload: Dict[str, Any], ts: str) -> None:
+    approval_id = payload.get("approval_id")
+    invoice_id = payload.get("invoice_id")
+    vendor_id = payload.get("vendor_id")
+    amount = payload.get("amount")
+    if not isinstance(approval_id, str) or not approval_id:
+        _fail("AUDIT_LOG_CORRUPT", "PAYOUT_APPROVAL_REQUESTED missing approval_id")
+    if not isinstance(invoice_id, str) or not invoice_id:
+        _fail(
+            "AUDIT_LOG_CORRUPT",
+            f"PAYOUT_APPROVAL_REQUESTED {approval_id} missing invoice_id",
+        )
+    if not isinstance(vendor_id, str) or not vendor_id:
+        _fail(
+            "AUDIT_LOG_CORRUPT",
+            f"PAYOUT_APPROVAL_REQUESTED {approval_id} missing vendor_id",
+        )
+    if isinstance(amount, bool) or not isinstance(amount, (int, float)):
+        _fail("AUDIT_LOG_CORRUPT", f"PAYOUT_APPROVAL_REQUESTED {approval_id} bad amount")
+    if approval_id in _APPROVALS:
+        return
+    invoice = _INVOICES.get(invoice_id)
+    if invoice is None:
+        _fail(
+            "AUDIT_LOG_CORRUPT",
+            f"approval {approval_id} for unknown invoice {invoice_id}",
+        )
+    if invoice["status"] != "MATCHED":
+        _LOG.warning(
+            "replay: skipping approval %s; invoice %s is %s",
+            approval_id,
+            invoice_id,
+            invoice["status"],
+        )
+        return
+    invoice["status"] = "PENDING_APPROVAL"
+    invoice["updated_at"] = ts
+    _APPROVALS[approval_id] = {
+        "approval_id": approval_id,
+        "invoice_id": invoice_id,
+        "po_id": payload.get("po_id") or invoice.get("po_id"),
+        "vendor_id": vendor_id,
+        "amount": float(amount),
+        "currency": payload.get("currency") or invoice.get("currency", "USD"),
+        "status": "PENDING",
+        "requested_by": "agent",
+        "requested_at": ts,
+        "correlation_id": "",
+        "approver": None,
+        "decided_at": None,
+        "executed_at": None,
+    }
+
+
+def _replay_approved(payload: Dict[str, Any], ts: str) -> None:
+    approval_id = payload.get("approval_id")
+    approver = payload.get("approver")
+    if not isinstance(approval_id, str) or not approval_id:
+        _fail("AUDIT_LOG_CORRUPT", "PAYOUT_APPROVED missing approval_id")
+    if not isinstance(approver, str) or not approver.strip():
+        _fail("AUDIT_LOG_CORRUPT", f"PAYOUT_APPROVED {approval_id} missing approver")
+    approval = _APPROVALS.get(approval_id)
+    if approval is None:
+        _LOG.warning("replay: skipping approval %s; unknown", approval_id)
+        return
+    if approval["status"] != "PENDING":
+        return
+    invoice = _INVOICES.get(approval["invoice_id"])
+    if invoice is None or invoice["status"] != "PENDING_APPROVAL":
+        _LOG.warning("replay: skipping approval %s; invoice not pending", approval_id)
+        return
+    invoice["status"] = "APPROVED"
+    invoice["updated_at"] = ts
+    approval["status"] = "APPROVED"
+    approval["approver"] = approver.strip()
+    approval["decided_at"] = ts
+
+
+def _replay_executed(payload: Dict[str, Any], ts: str) -> None:
+    approval_id = payload.get("approval_id")
+    if not isinstance(approval_id, str) or not approval_id:
+        _fail("AUDIT_LOG_CORRUPT", "PAYOUT_EXECUTED missing approval_id")
+    approval = _APPROVALS.get(approval_id)
+    if approval is None:
+        _LOG.warning("replay: skipping execution %s; unknown", approval_id)
+        return
+    if approval["status"] != "APPROVED":
+        return
+    invoice = _INVOICES.get(approval["invoice_id"])
+    if invoice is None or invoice["status"] != "APPROVED":
+        _LOG.warning("replay: skipping execution %s; invoice not approved", approval_id)
+        return
+    invoice["status"] = "PAID"
+    invoice["updated_at"] = ts
+    approval["status"] = "EXECUTED"
+    approval["executed_at"] = ts
+    executor = payload.get("executor")
+    if isinstance(executor, str) and executor.strip():
+        approval["executor"] = executor.strip()
+
+
+def _replay_audit_entries(entries: List[Dict[str, Any]]) -> None:
+    """Rebuild business state by replaying the durable chain in seq order.
+
+    The chain is the source of truth: ``_commit`` writes the audit link before
+    the mutation, so a crash can leave a link whose mutation never landed.
+    Replay applies it, which is at-least-once and safe because every transition
+    is status-guarded. A link that would move an invoice backwards (for example
+    a ``THREE_WAY_MATCH`` after a ``PAYOUT_EXECUTED``) is skipped with a warning
+    rather than applied, so a restart cannot resurrect a paid invoice.
+
+    Unknown event types (agent notes, tool brackets) are ignored.
+    """
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        event_type = entry.get("event_type")
+        payload = entry.get("payload")
+        if not isinstance(payload, dict):
+            continue
+        ts = entry.get("ts") or _now()
+        if event_type == "INVOICE_INGESTED":
+            _replay_ingest(payload, ts)
+        elif event_type == "THREE_WAY_MATCH":
+            _replay_match(payload, ts)
+        elif event_type == "PAYOUT_APPROVAL_REQUESTED":
+            _replay_approval_requested(payload, ts)
+        elif event_type == "PAYOUT_APPROVED":
+            _replay_approved(payload, ts)
+        elif event_type == "PAYOUT_EXECUTED":
+            _replay_executed(payload, ts)
+
+
+def _recover_audit_state() -> None:
+    """Load ``audit_log.jsonl`` and rebuild business state from it.
+
+    Called once at import time. The chain is durable; the dicts it describes
+    are not, so without replay a restart resets every invoice to ``RECEIVED``
+    and a paid invoice can be matched and paid again. If the file cannot be
+    parsed, read, or replayed, the in-memory chain is left empty, business
+    state is reset to the seed literals, and ``_AUDIT_RECOVERY_ERROR`` is set;
     ``_append_audit`` then refuses to write until an operator repairs the log.
     """
     global _AUDIT_SEQ, _AUDIT_RECOVERY_ERROR
@@ -431,6 +702,7 @@ def _recover_audit_state() -> None:
             _AUDIT.clear()
             _AUDIT_SEQ = 0
             _AUDIT_RECOVERY_ERROR = f"{exc.code}: {exc.detail}"
+            _reset_business_state()
             return
         except OSError as exc:
             # Defensive: ``_load_audit_from_file`` already converts OSError to
@@ -439,10 +711,20 @@ def _recover_audit_state() -> None:
             _AUDIT.clear()
             _AUDIT_SEQ = 0
             _AUDIT_RECOVERY_ERROR = f"AUDIT_LOG_UNREADABLE: {exc}"
+            _reset_business_state()
             return
 
         _AUDIT.clear()
         _AUDIT.extend(entries)
+
+        try:
+            _replay_audit_entries(entries)
+        except ToolError as exc:
+            _AUDIT.clear()
+            _AUDIT_SEQ = 0
+            _AUDIT_RECOVERY_ERROR = f"{exc.code}: {exc.detail}"
+            _reset_business_state()
+            return
 
         last_seq = entries[-1].get("seq") if entries else 0
         if isinstance(last_seq, int) and not isinstance(last_seq, bool):
@@ -478,16 +760,10 @@ def _reset_state() -> None:
     """
     global _AUDIT_SEQ, _AUDIT_RECOVERY_ERROR
     with _LOCK:
-        _APPROVALS.clear()
+        _reset_business_state()
         _AUDIT.clear()
         _AUDIT_SEQ = 0
         _AUDIT_RECOVERY_ERROR = ""
-        for invoice_id in list(_INVOICES.keys()):
-            if invoice_id not in _SEED_INVOICE_IDS:
-                del _INVOICES[invoice_id]
-        for invoice in _INVOICES.values():
-            invoice["status"] = "RECEIVED"
-            invoice["updated_at"] = invoice["created_at"]
         path = config.AUDIT_LOG_PATH
         if path:
             with open(path, "w", encoding="utf-8"):
@@ -697,7 +973,9 @@ def request_payout_approval(
                 "approval_id": approval_id,
                 "invoice_id": invoice_id,
                 "vendor_id": vendor_id,
+                "po_id": po_id,
                 "amount": approval["amount"],
+                "currency": approval["currency"],
             },
             correlation_id,
         )
@@ -715,15 +993,32 @@ def request_payout_approval(
 
 
 def log_audit_event(
-    event_type: str, payload: Dict[str, Any], correlation_id: str = ""
+    event_type: str,
+    payload: Dict[str, Any],
+    correlation_id: str = "",
+    source: str = "agent",
 ) -> Dict[str, Any]:
-    """Record an agent reasoning note in the audit trail."""
+    """Record an agent reasoning note in the audit trail.
+
+    ``source="agent"`` (the default, and the only value the model can reach)
+    refuses the tool-authored event types, so a model note cannot masquerade as
+    a real approval gate or settlement. The control plane passes
+    ``source="tool"`` for its own brackets.
+    """
     if not isinstance(event_type, str) or not event_type.strip():
         return {"ok": False, "error": "INVALID_EVENT_TYPE"}
     if not isinstance(payload, dict):
         return {"ok": False, "error": "INVALID_PAYLOAD"}
 
-    entry = _append_audit(event_type.strip(), payload, correlation_id)
+    clean = event_type.strip()
+    if source == "agent" and clean in _RESERVED_EVENT_TYPES:
+        return {
+            "ok": False,
+            "error": "RESERVED_EVENT_TYPE",
+            "event_type": clean,
+        }
+
+    entry = _append_audit(clean, payload, correlation_id, source=source)
     return {"ok": True, "seq": entry["seq"], "hash": entry["hash"]}
 
 
@@ -885,6 +1180,7 @@ def ingest_invoice(
                 "vendor_id": vendor_id,
                 "po_id": po_id,
                 "amount": invoice["amount"],
+                "currency": invoice["currency"],
             },
             correlation_id,
         )
@@ -960,8 +1256,19 @@ def approve_payout(
         }
 
 
-def _execute_payout(approval_id: str, correlation_id: str = "") -> Dict[str, Any]:
-    """Settle an approved payout. Private: never exposed to the model."""
+def _execute_payout(
+    approval_id: str, executor: str = "", correlation_id: str = ""
+) -> Dict[str, Any]:
+    """Settle an approved payout. Private: never exposed to the model.
+
+    ``executor`` is the authenticated principal's ``sub``. Separation of duties
+    is enforced here, under ``_LOCK``, so a direct caller cannot bypass it: the
+    person who approved a payout cannot be the person who settles it.
+    """
+    if not isinstance(executor, str) or not executor.strip():
+        return {"ok": False, "error": "INVALID_EXECUTOR"}
+    clean_executor = executor.strip()
+
     with _LOCK:
         approval = _APPROVALS.get(approval_id)
         if approval is None:
@@ -975,6 +1282,15 @@ def _execute_payout(approval_id: str, correlation_id: str = "") -> Dict[str, Any
                 "ok": False,
                 "error": "APPROVAL_NOT_APPROVED",
                 "status": approval["status"],
+            }
+
+        approver = approval.get("approver")
+        if approver and approver == clean_executor:
+            return {
+                "ok": False,
+                "error": "SEPARATION_OF_DUTIES",
+                "approver": approver,
+                "executor": clean_executor,
             }
 
         invoice = _INVOICES.get(approval["invoice_id"])
@@ -997,6 +1313,7 @@ def _execute_payout(approval_id: str, correlation_id: str = "") -> Dict[str, Any
             _transition(invoice["invoice_id"], ("APPROVED",), "PAID", correlation_id)
             approval["status"] = "EXECUTED"
             approval["executed_at"] = _now()
+            approval["executor"] = clean_executor
 
         _commit(
             mutation,
@@ -1006,6 +1323,7 @@ def _execute_payout(approval_id: str, correlation_id: str = "") -> Dict[str, Any
                 "invoice_id": invoice["invoice_id"],
                 "vendor_id": approval["vendor_id"],
                 "amount": approval["amount"],
+                "executor": clean_executor,
             },
             correlation_id,
         )
@@ -1016,6 +1334,7 @@ def _execute_payout(approval_id: str, correlation_id: str = "") -> Dict[str, Any
             "amount": approval["amount"],
             "status": "PAID",
             "settled_at": approval["executed_at"],
+            "executor": clean_executor,
         }
 
 # ---------------------------------------------------------------------------
@@ -1118,6 +1437,6 @@ def _apply_audit_note(
 # Startup recovery
 # ---------------------------------------------------------------------------
 
-# Load the durable chain at import so the first append continues it rather than
-# forking a fresh chain on top of an existing audit_log.jsonl.
+# Load the durable chain at import and replay it so business state matches the
+# chain instead of resetting to the seed literals on every restart.
 _recover_audit_state()

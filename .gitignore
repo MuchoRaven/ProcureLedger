@@ -1,2 +1,4 @@
 .aider*
 .env
+audit_log.jsonl
+*.lock
