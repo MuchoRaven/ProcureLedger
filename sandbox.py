@@ -106,14 +106,24 @@ class _SpawnResult:
     envelope: Optional[Dict[str, Any]] = None
 
 
-def _snapshot(tool: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
+def _snapshot(
+    tool: str,
+    arguments: Dict[str, Any],
+    as_of: Optional[str] = None,
+) -> Dict[str, Any]:
     """Build the tool-scoped snapshot from the call's selector arguments.
 
     Both ``_build_request`` and ``_redeci`` go through here so the sandbox and
     the control plane see identical snapshots; otherwise every read would be
     reported as ``stale``.
+
+    ``as_of`` is the reference date frozen into the request envelope. It is
+    only used when the caller did not pass an explicit ``as_of`` argument, so
+    a call that straddles UTC midnight still compares equal on both sides.
     """
     ids = {key: arguments[key] for key in _SNAPSHOT_ARG_KEYS if key in arguments}
+    if "as_of" not in ids and as_of is not None:
+        ids["as_of"] = as_of
     return tools._snapshot_for(tool, **ids)
 
 
@@ -253,8 +263,11 @@ def _redeci(
     """
     tool = request["tool"]
     arguments = request["arguments"]
+    # Reuse the reference date frozen into the request so a call that straddles
+    # UTC midnight does not spuriously diverge from the sandbox's snapshot.
+    frozen_as_of = (request.get("snapshot") or {}).get("as_of")
     try:
-        live = _snapshot(tool, arguments)
+        live = _snapshot(tool, arguments, as_of=frozen_as_of)
         expected = decisions.decide(tool, arguments, live)
     except Exception:
         # Mirror the worker's guard: a raise here must not escape as a 500.
