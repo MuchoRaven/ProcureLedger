@@ -67,6 +67,20 @@ _LOG = logging.getLogger(__name__)
 # Binaries the sandbox cannot run without. Checked by ``preflight``.
 _REQUIRED_BINARIES = ("bwrap", "prlimit")
 
+# Argument keys that select records for the sandbox snapshot. Only these are
+# forwarded to ``tools._snapshot_for``; everything else in ``arguments``
+# (amounts, notes, ...) is business data, not a selector. ``as_of`` is not an
+# ID but is forwarded so the snapshot is a pure function of the arguments.
+_SNAPSHOT_ARG_KEYS = (
+    "invoice_id",
+    "vendor_id",
+    "po_id",
+    "requisition_id",
+    "receipt_id",
+    "approval_id",
+    "as_of",
+)
+
 
 def preflight() -> None:
     """Fail fast if this host cannot run the sandbox.
@@ -92,6 +106,17 @@ class _SpawnResult:
     envelope: Optional[Dict[str, Any]] = None
 
 
+def _snapshot(tool: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
+    """Build the tool-scoped snapshot from the call's selector arguments.
+
+    Both ``_build_request`` and ``_redeci`` go through here so the sandbox and
+    the control plane see identical snapshots; otherwise every read would be
+    reported as ``stale``.
+    """
+    ids = {key: arguments[key] for key in _SNAPSHOT_ARG_KEYS if key in arguments}
+    return tools._snapshot_for(tool, **ids)
+
+
 def _build_request(
     tool: str,
     arguments: Dict[str, Any],
@@ -110,7 +135,7 @@ def _build_request(
             "roles": sorted(getattr(principal, "roles", [])),
             "auth_method": getattr(principal, "auth_method", "service"),
         },
-        "snapshot": tools._snapshot_for(tool),
+        "snapshot": _snapshot(tool, arguments),
         "limits": dict(config.SANDBOX_LIMITS),
     }
 
@@ -229,7 +254,7 @@ def _redeci(
     tool = request["tool"]
     arguments = request["arguments"]
     try:
-        live = tools._snapshot_for(tool)
+        live = _snapshot(tool, arguments)
         expected = decisions.decide(tool, arguments, live)
     except Exception:
         # Mirror the worker's guard: a raise here must not escape as a 500.
