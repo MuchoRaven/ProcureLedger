@@ -7,13 +7,21 @@ The agent is reachable only through ``/agent/run``. Human approval and payout
 settlement are deliberately separate endpoints so a model can never settle a
 payout on its own. ``/audit`` and ``/audit/verify`` read the on-disk chain.
 
+Procurement records (POs and requisitions) are app-layer only. ``/pos`` and
+``/requisitions`` expose them over HTTP, but nothing in ``tools`` or
+``decisions`` puts them in ``decisions.PROPOSAL_KINDS``, so the model cannot
+reach them. The listing helpers live here rather than in ``tools`` for the
+same reason: a listing needs the whole store, which is exactly the widening
+``tools._snapshot_for`` refuses to do.
+
 Authentication
 --------------
 Every endpoint except ``/health`` requires ``Authorization: Bearer <token>``.
 Three credentials exist and they are not interchangeable:
 
 * ``PL_AGENT_TOKEN``    - role ``agent``.    ``/agent/run``.
-* ``PL_OPERATOR_TOKEN`` - role ``operator``. Invoice ingest and approval.
+* ``PL_OPERATOR_TOKEN`` - role ``operator``. Invoice ingest, approval, and
+  procurement mutations (create PO, record receipt, close/cancel PO).
 * ``PL_EXECUTOR_TOKEN`` - role ``executor``. Payout settlement.
 
 The split is the point: the human-approval gate is meaningless if the agent's
@@ -324,6 +332,7 @@ _TOOL_ERROR_STATUS = {
     "APPROVAL_NOT_FOUND": 404,
     "VENDOR_NOT_FOUND": 404,
     "PO_NOT_FOUND": 404,
+    "REQUISITION_NOT_FOUND": 404,
     "INVALID_TRANSITION": 409,
     "INVOICE_EXISTS": 409,
     "INVOICE_NOT_MATCHED": 409,
@@ -338,6 +347,9 @@ _TOOL_ERROR_STATUS = {
     "VENDOR_HIGH_RISK": 409,
     "VENDOR_MISMATCH": 409,
     "PO_INVOICE_MISMATCH": 409,
+    "PO_NOT_OPEN": 409,
+    "RECEIPT_EXCEEDS_PO": 409,
+    "REQUISITION_NOT_OPEN": 409,
     "AMOUNT_MISMATCH": 409,
 }
 
@@ -380,6 +392,26 @@ class ApproveRequest(BaseModel):
 
 
 class ExecuteRequest(BaseModel):
+    correlation_id: str = ""
+
+
+class CreatePORequest(BaseModel):
+    vendor_id: str
+    amount: Amount
+    currency: str = "USD"
+    expected_delivery: str = ""
+    requisition_id: str = ""
+    correlation_id: str = ""
+
+
+class ReceiptRequest(BaseModel):
+    amount: Amount
+    correlation_id: str = ""
+
+
+class ActionRequest(BaseModel):
+    """Body for a state-change endpoint that takes no business fields."""
+
     correlation_id: str = ""
 
 # ---------------------------------------------------------------------------
@@ -530,6 +562,37 @@ def handle_validation_error(
     )
 
 # ---------------------------------------------------------------------------
+# App-layer listings
+# ---------------------------------------------------------------------------
+#
+# These live here, not in ``tools``, on purpose. A listing needs the whole
+# store, which is exactly the widening ``tools._snapshot_for`` refuses to do;
+# keeping them out of ``tools`` means they can never drift into
+# ``decisions.PROPOSAL_KINDS`` and become model-reachable. They read the
+# module-level dicts under ``tools._LOCK`` so a concurrent mutation cannot be
+# observed half-applied.
+
+
+def list_pos() -> Dict[str, Any]:
+    """Return every PO, sorted by ID. App-layer only."""
+    with tools._LOCK:
+        return {
+            "ok": True,
+            "pos": [dict(po) for _, po in sorted(tools._POS.items())],
+        }
+
+
+def list_requisitions() -> Dict[str, Any]:
+    """Return every requisition, sorted by ID. App-layer only."""
+    with tools._LOCK:
+        return {
+            "ok": True,
+            "requisitions": [
+                dict(req) for _, req in sorted(tools._REQUISITIONS.items())
+            ],
+        }
+
+# ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
 
@@ -653,6 +716,108 @@ def ingest_invoice(
         ),
         correlation_id,
     )
+
+
+@app.get("/pos")
+def pos_index(
+    cid: str = Depends(correlation_id_header),
+    principal: tools.Principal = Depends(require_any),
+) -> Any:
+    """List every PO. App-layer only; the model cannot reach this."""
+    return _respond(list_pos(), cid)
+
+
+@app.get("/pos/{po_id}")
+def get_po(
+    po_id: str,
+    cid: str = Depends(correlation_id_header),
+    principal: tools.Principal = Depends(require_any),
+) -> Any:
+    return _respond(tools.get_po(po_id), cid)
+
+
+@app.post("/pos")
+def create_po(
+    req: CreatePORequest,
+    cid: str = Depends(correlation_id_header),
+    principal: tools.Principal = Depends(require_operator),
+) -> Any:
+    """Create a PO. Operator-only; never reachable by the model."""
+    correlation_id = _resolve_correlation_id(cid, req.correlation_id)
+    return _respond(
+        tools.create_po(
+            req.vendor_id,
+            req.amount,
+            currency=req.currency,
+            expected_delivery=req.expected_delivery,
+            requisition_id=req.requisition_id,
+            correlation_id=correlation_id,
+        ),
+        correlation_id,
+    )
+
+
+@app.post("/pos/{po_id}/receipts")
+def record_goods_receipt(
+    po_id: str,
+    req: ReceiptRequest,
+    cid: str = Depends(correlation_id_header),
+    principal: tools.Principal = Depends(require_operator),
+) -> Any:
+    """Record a goods receipt against an OPEN PO. Operator-only."""
+    correlation_id = _resolve_correlation_id(cid, req.correlation_id)
+    return _respond(
+        tools.record_goods_receipt(
+            po_id, req.amount, correlation_id=correlation_id
+        ),
+        correlation_id,
+    )
+
+
+@app.post("/pos/{po_id}/close")
+def close_po(
+    po_id: str,
+    req: ActionRequest,
+    cid: str = Depends(correlation_id_header),
+    principal: tools.Principal = Depends(require_operator),
+) -> Any:
+    """Close an OPEN PO. Operator-only."""
+    correlation_id = _resolve_correlation_id(cid, req.correlation_id)
+    return _respond(
+        tools.close_po(po_id, correlation_id=correlation_id), correlation_id
+    )
+
+
+@app.post("/pos/{po_id}/cancel")
+def cancel_po(
+    po_id: str,
+    req: ActionRequest,
+    cid: str = Depends(correlation_id_header),
+    principal: tools.Principal = Depends(require_operator),
+) -> Any:
+    """Cancel an OPEN PO. Operator-only."""
+    correlation_id = _resolve_correlation_id(cid, req.correlation_id)
+    return _respond(
+        tools.cancel_po(po_id, correlation_id=correlation_id), correlation_id
+    )
+
+
+@app.get("/requisitions")
+def requisition_index(
+    cid: str = Depends(correlation_id_header),
+    principal: tools.Principal = Depends(require_any),
+) -> Any:
+    """List every requisition. App-layer only; the model cannot reach this."""
+    return _respond(list_requisitions(), cid)
+
+
+@app.get("/requisitions/{requisition_id}")
+def get_requisition(
+    requisition_id: str,
+    cid: str = Depends(correlation_id_header),
+    principal: tools.Principal = Depends(require_any),
+) -> Any:
+    return _respond(tools.get_requisition(requisition_id), cid)
 
 
 @app.get("/approvals/{approval_id}")

@@ -22,6 +22,17 @@ model):
 * ``approve_payout(approval_id, approver, correlation_id="")``
 * ``_execute_payout(approval_id, executor, correlation_id="")``
 * ``verify_audit_chain(from_file=True)``
+* ``create_po(vendor_id, amount, currency="USD", expected_delivery="",
+  requisition_id="", correlation_id="")``
+* ``record_goods_receipt(po_id, amount, correlation_id="")``
+* ``close_po(po_id, correlation_id="")`` / ``cancel_po(po_id,
+  correlation_id="")``
+* ``get_po(po_id)`` / ``get_requisition(requisition_id)``
+
+Listing tools (``list_pos`` / ``list_requisitions``) deliberately live in
+``app.py``, not here: they need the whole store, which is exactly the widening
+``_snapshot_for`` refuses to do. Keeping them out of this module means they can
+never drift into ``decisions.PROPOSAL_KINDS`` and become model-reachable.
 
 ``_snapshot_for`` is the only view of global state the sandbox is allowed to
 see, so it is deliberately narrow: the requested record plus its immediate
@@ -1040,6 +1051,48 @@ def get_invoice_aging(invoice_id: str, as_of: str = "") -> Dict[str, Any]:
     }
 
 
+def get_po(po_id: str) -> Dict[str, Any]:
+    """Return a PO record, or ``PO_NOT_FOUND``.
+
+    App-layer only: it is not in ``decisions.PROPOSAL_KINDS``, so the model
+    cannot reach it. A plain read in the style of ``get_invoice`` - it reports
+    a missing record in-band rather than raising.
+    """
+    if not isinstance(po_id, str) or not po_id:
+        return {
+            "ok": False,
+            "error": "INVALID_ARGUMENTS",
+            "detail": "po_id must be a non-empty string",
+        }
+    with _LOCK:
+        po = _POS.get(po_id)
+        if po is None:
+            return {"ok": False, "error": "PO_NOT_FOUND", "detail": po_id}
+        return {"ok": True, "po": dict(po)}
+
+
+def get_requisition(requisition_id: str) -> Dict[str, Any]:
+    """Return a requisition record, or ``REQUISITION_NOT_FOUND``.
+
+    App-layer only, for the same reason as ``get_po``.
+    """
+    if not isinstance(requisition_id, str) or not requisition_id:
+        return {
+            "ok": False,
+            "error": "INVALID_ARGUMENTS",
+            "detail": "requisition_id must be a non-empty string",
+        }
+    with _LOCK:
+        requisition = _REQUISITIONS.get(requisition_id)
+        if requisition is None:
+            return {
+                "ok": False,
+                "error": "REQUISITION_NOT_FOUND",
+                "detail": requisition_id,
+            }
+        return {"ok": True, "requisition": dict(requisition)}
+
+
 def run_three_way_match(
     invoice_id: str, po_id: str, correlation_id: str = ""
 ) -> Dict[str, Any]:
@@ -1066,6 +1119,64 @@ def request_payout_approval(
             "po_id": po_id,
             "invoice_id": invoice_id,
         },
+        correlation_id,
+    )
+
+
+def create_po(
+    vendor_id: str,
+    amount: Any,
+    currency: str = "USD",
+    expected_delivery: str = "",
+    requisition_id: str = "",
+    correlation_id: str = "",
+) -> Dict[str, Any]:
+    """Create a purchase order. App-layer only; never reachable by the model.
+
+    A thin pass-through to ``_apply_create_po`` so the ID generation, the
+    ``_LOCK`` re-checks and the audit-before-mutation ordering all stay in one
+    place. ``requisition_id`` is normalised to ``None`` when blank, matching
+    the proposal contract.
+    """
+    return _apply_create_po(
+        {
+            "kind": "create_po",
+            "vendor_id": vendor_id,
+            "amount": amount,
+            "currency": currency,
+            "expected_delivery": expected_delivery,
+            "requisition_id": requisition_id or None,
+        },
+        correlation_id,
+    )
+
+
+def record_goods_receipt(
+    po_id: str, amount: Any, correlation_id: str = ""
+) -> Dict[str, Any]:
+    """Record a goods receipt against an OPEN PO. App-layer only.
+
+    The over-receipt control lives in ``_check_record_receipt`` and runs under
+    ``_LOCK`` before the audit link is written.
+    """
+    return _apply_record_receipt(
+        {"kind": "record_receipt", "po_id": po_id, "amount": amount},
+        correlation_id,
+    )
+
+
+def close_po(po_id: str, correlation_id: str = "") -> Dict[str, Any]:
+    """Close an OPEN PO. App-layer only."""
+    return _apply_po_status(
+        {"kind": "po_status", "po_id": po_id, "to_status": PO_STATUS_CLOSED},
+        correlation_id,
+    )
+
+
+def cancel_po(po_id: str, correlation_id: str = "") -> Dict[str, Any]:
+    """Cancel an OPEN PO. App-layer only."""
+    return _apply_po_status(
+        {"kind": "po_status", "po_id": po_id, "to_status": PO_STATUS_CANCELLED},
         correlation_id,
     )
 
