@@ -49,6 +49,28 @@ def clean_state(tmp_path, monkeypatch):
     tools._reset_state()
 
 
+def _events(event_type):
+    """Return the durable audit entries of one type."""
+    return [
+        entry
+        for entry in tools._load_audit_from_file()
+        if entry["event_type"] == event_type
+    ]
+
+
+def _call(fn, *args):
+    """Call a tool function, normalising a raised ``ToolError`` to a result.
+
+    The tool surface is mixed: some entry points return ``{"ok": False, ...}``
+    and some raise ``ToolError``. Tests should assert on the outcome, not on
+    which of the two styles a given function happens to use.
+    """
+    try:
+        return fn(*args)
+    except tools.ToolError as exc:
+        return {"ok": False, "error": exc.code, "detail": exc.detail}
+
+
 def test_allowlist_matches_decisions():
     assert agent.ALLOWED_TOOLS == set(decisions.PROPOSAL_KINDS)
 
@@ -193,3 +215,148 @@ def test_audit_write_failure_leaves_approval_state_unchanged(clean_state, monkey
     invoice = tools.get_invoice("INV-2001")["invoice"]
     assert invoice["status"] == "MATCHED"
     assert tools._APPROVALS == {}
+
+
+# ---------------------------------------------------------------------------
+# Procurement lifecycle: PO / receipt / requisition
+# ---------------------------------------------------------------------------
+
+
+def test_create_po_emits_po_created(clean_state):
+    """Creating a PO records a ``PO_CREATED`` link attributed to the tool."""
+    _call(
+        tools.create_po,
+        "PO-9001",
+        "VEND-001",
+        500.00,
+        "USD",
+        "2024-03-01",
+        None,
+        "cid-po",
+    )
+
+    assert "PO-9001" in tools._POS
+
+    events = _events("PO_CREATED")
+    assert len(events) == 1
+    assert events[0]["source"] == "tool"
+    assert events[0]["payload"]["po_id"] == "PO-9001"
+
+
+def test_create_po_converts_requisition(clean_state):
+    """A PO raised against an open requisition converts it and links it back."""
+    result = _call(
+        tools.create_po,
+        "PO-9002",
+        "VEND-001",
+        800.00,
+        "USD",
+        "2024-03-01",
+        "REQ-4002",
+        "cid-req",
+    )
+    assert result["ok"] is True
+
+    requisition = tools._REQUISITIONS["REQ-4002"]
+    assert requisition["status"] == "CONVERTED"
+    assert requisition["po_id"] == "PO-9002"
+
+
+def test_record_receipt_emits_goods_receipt(clean_state):
+    """A receipt against an open PO records a ``GOODS_RECEIPT_RECORDED`` link.
+
+    The seed POs are both fully received, so this raises a fresh PO first.
+    """
+    assert (
+        _call(
+            tools.create_po,
+            "PO-9003",
+            "VEND-001",
+            500.00,
+            "USD",
+            "2024-03-01",
+            None,
+            "cid-po",
+        )["ok"]
+        is True
+    )
+
+    result = _call(tools.record_receipt, "RCPT-9001", "PO-9003", 500.00, "cid-rcpt")
+    assert result["ok"] is True
+    assert "RCPT-9001" in tools._RECEIPTS
+
+    events = _events("GOODS_RECEIPT_RECORDED")
+    assert len(events) == 1
+    assert events[0]["source"] == "tool"
+
+
+def test_record_receipt_rejects_over_receipt(clean_state):
+    """Receiving more than the PO is worth is refused, and nothing is stored.
+
+    ``PO-1002`` is already fully covered by ``RCPT-3002``.
+    """
+    result = _call(tools.record_receipt, "RCPT-9002", "PO-1002", 100.00, "cid-over")
+    assert result["ok"] is False
+    assert result["error"] == "RECEIPT_EXCEEDS_PO"
+    assert "RCPT-9002" not in tools._RECEIPTS
+
+
+def test_po_status_change_emits_event(clean_state):
+    """Closing a PO records a ``PO_STATUS_CHANGED`` link and moves the status."""
+    result = tools._apply_transition(
+        {"kind": "transition", "po_id": "PO-1001", "status": "CLOSED"},
+        "cid-close",
+    )
+    assert result["ok"] is True
+    assert tools._POS["PO-1001"]["status"] == "CLOSED"
+
+    events = _events("PO_STATUS_CHANGED")
+    assert len(events) == 1
+    assert events[0]["source"] == "tool"
+
+
+def test_create_requisition_emits_event(clean_state):
+    """Raising a requisition records a ``REQUISITION_CREATED`` link."""
+    result = _call(
+        tools.create_requisition,
+        "REQ-9001",
+        "Spare belts",
+        10,
+        250.00,
+        "USD",
+        "operator",
+        "cid-req",
+    )
+    assert result["ok"] is True
+    assert "REQ-9001" in tools._REQUISITIONS
+
+    events = _events("REQUISITION_CREATED")
+    assert len(events) == 1
+    assert events[0]["source"] == "tool"
+
+
+def test_aging_reachable_by_model(clean_state):
+    """``get_invoice_aging`` is on the agent allowlist.
+
+    The call itself may fail for any other reason (no sandbox on this host, a
+    missing argument, ...); what must not happen is the allowlist rejecting it.
+    """
+    result = agent.dispatch_tool(
+        "get_invoice_aging", {"as_of": "2024-02-01"}, "cid-aging"
+    )
+    assert result.get("error") != "TOOL_NOT_ALLOWED"
+
+
+def test_audit_write_failure_leaves_po_state_unchanged(clean_state, monkeypatch):
+    """A failed audit write must not leave an unrecorded PO status change."""
+    before = {po_id: dict(po) for po_id, po in tools._POS.items()}
+
+    monkeypatch.setattr(tools, "_persist_audit", _fail_audit_write)
+
+    result = tools._apply_transition(
+        {"kind": "transition", "po_id": "PO-1001", "status": "CLOSED"},
+        "cid-fail",
+    )
+    assert result["ok"] is False
+    assert result["error"] == "AUDIT_WRITE_FAILED"
+    assert tools._POS == before
