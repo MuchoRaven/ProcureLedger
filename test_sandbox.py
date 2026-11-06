@@ -310,6 +310,12 @@ def test_every_proposal_kind_is_applied(monkeypatch):
         sandbox.tools, "_apply_create_approval", _stub("create_approval")
     )
     monkeypatch.setattr(sandbox.tools, "_apply_audit_note", _stub("audit_note"))
+    # ``create_requisition`` is applied by ``tools._apply_create_requisition``.
+    # Stub it too: the loop below calls ``_apply`` with an empty ``data``
+    # payload, and the real function would touch the store lock and audit log.
+    monkeypatch.setattr(
+        sandbox.tools, "_apply_create_requisition", _stub("create_requisition")
+    )
 
     kinds = set()
     for tool_kinds in decisions.PROPOSAL_KINDS.values():
