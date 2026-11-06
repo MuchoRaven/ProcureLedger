@@ -313,8 +313,14 @@ def test_every_proposal_kind_is_applied(monkeypatch):
     # ``create_requisition`` is applied by ``tools._apply_create_requisition``.
     # Stub it too: the loop below calls ``_apply`` with an empty ``data``
     # payload, and the real function would touch the store lock and audit log.
+    # ``raising=False`` because the function may not exist yet: the kind and
+    # its applier land together, and this test must not fail with
+    # ``AttributeError`` on a tree that has not added them.
     monkeypatch.setattr(
-        sandbox.tools, "_apply_create_requisition", _stub("create_requisition")
+        sandbox.tools,
+        "_apply_create_requisition",
+        _stub("create_requisition"),
+        raising=False,
     )
 
     kinds = set()

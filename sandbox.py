@@ -319,6 +319,8 @@ def _apply(
         return tools._apply_transition(proposal, correlation_id)
     if kind == "create_approval":
         return tools._apply_create_approval(proposal, correlation_id)
+    if kind == "create_requisition":
+        return tools._apply_create_requisition(proposal, correlation_id)
     if kind == "audit_note":
         return tools._apply_audit_note(proposal, correlation_id)
     return {"ok": False, "error": "UNKNOWN_PROPOSAL_KIND", "kind": kind}
