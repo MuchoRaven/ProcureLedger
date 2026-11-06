@@ -522,6 +522,23 @@ _TOOL_ERROR_STATUS = {
     "RECEIPT_EXCEEDS_PO": 409,
     "REQUISITION_NOT_OPEN": 409,
     "AMOUNT_MISMATCH": 409,
+    # Phase 0: RFQs, quotes, stock. ``*_NOT_FOUND`` -> 404; the rest are state
+    # conflicts -> 409. ``RFQ_HAS_NO_QUOTES`` matches none of the suffix rules
+    # but is a conflict (the RFQ exists, it just cannot be awarded yet), so it
+    # is 409 rather than 404.
+    "RFQ_NOT_FOUND": 404,
+    "QUOTE_NOT_FOUND": 404,
+    "STOCK_ITEM_NOT_FOUND": 404,
+    "RFQ_NOT_OPEN": 409,
+    "RFQ_EXISTS": 409,
+    "RFQ_HAS_NO_QUOTES": 409,
+    "QUOTE_EXISTS": 409,
+    "QUOTE_VENDOR_MISMATCH": 409,
+    "QUOTE_CURRENCY_MISMATCH": 409,
+    "QUOTE_EXPIRED": 409,
+    "QUOTE_NOT_SUBMITTED": 409,
+    "QUOTE_ALREADY_AWARDED": 409,
+    "REQUISITION_ALREADY_CONVERTED": 409,
 }
 
 # Status -> code for ``HTTPException`` raised by this module or by FastAPI.
@@ -593,6 +610,57 @@ class ReceiptRequest(BaseModel):
 class ActionRequest(BaseModel):
     """Body for a state-change endpoint that takes no business fields."""
 
+    correlation_id: str = ""
+
+# ---------------------------------------------------------------------------
+# Phase 0 request models: RFQs, quotes, requisition conversion, stock
+# ---------------------------------------------------------------------------
+#
+# These are the minimum field sets the Phase 1 endpoints need. ``due_date`` and
+# ``valid_until`` stay ``str`` here and are validated by the handler with
+# ``_validate_iso_date``, for the same reason ``Amount``/``Quantity`` are
+# ``confloat``: a pydantic validator would have to be written twice to work on
+# both v1 and v2, and this module is deliberately version-agnostic.
+
+
+class CreateRFQRequest(BaseModel):
+    description: str
+    quantity: Quantity
+    vendor_id: str = ""
+    requisition_id: str = ""
+    due_date: str = ""
+    currency: str = "USD"
+    correlation_id: str = ""
+
+
+class SubmitQuoteRequest(BaseModel):
+    vendor_id: str
+    amount: Amount
+    currency: str = "USD"
+    valid_until: str = ""
+    correlation_id: str = ""
+
+
+class AwardQuoteRequest(BaseModel):
+    quote_id: str
+    correlation_id: str = ""
+
+
+class ConvertRequisitionRequest(BaseModel):
+    vendor_id: str = ""
+    amount: Amount
+    currency: str = "USD"
+    expected_delivery: str = ""
+    correlation_id: str = ""
+
+
+class StockItemRequest(BaseModel):
+    item_id: str
+    description: str = ""
+    quantity: Quantity
+    unit_cost: Amount
+    vendor_id: str = ""
+    currency: str = "USD"
     correlation_id: str = ""
 
 # ---------------------------------------------------------------------------
