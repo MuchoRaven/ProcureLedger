@@ -171,6 +171,146 @@ _TOOL_SCHEMAS: List[Dict[str, Any]] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_invoice_aging",
+            "description": (
+                "Return the AP aging bucket for an invoice. Read-only."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "invoice_id": {"type": "string"},
+                    "as_of": {
+                        "type": "string",
+                        "description": (
+                            "ISO date to age against; defaults to today (UTC)."
+                        ),
+                    },
+                },
+                "required": ["invoice_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_po",
+            "description": "Read a purchase order record by ID. Read-only.",
+            "parameters": {
+                "type": "object",
+                "properties": {"po_id": {"type": "string"}},
+                "required": ["po_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_requisition",
+            "description": "Read a requisition record by ID. Read-only.",
+            "parameters": {
+                "type": "object",
+                "properties": {"requisition_id": {"type": "string"}},
+                "required": ["requisition_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_requisition",
+            "description": (
+                "Raise a purchase requisition. Does NOT create a PO."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "description": {"type": "string"},
+                    "vendor_id": {"type": "string"},
+                    "quantity": {"type": "number"},
+                    "amount": {"type": "number"},
+                    "currency": {"type": "string"},
+                },
+                "required": ["description", "quantity", "amount"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_po",
+            "description": (
+                "Create a purchase order, optionally from an OPEN requisition."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "vendor_id": {"type": "string"},
+                    "amount": {"type": "number"},
+                    "currency": {"type": "string"},
+                    "expected_delivery": {
+                        "type": "string",
+                        "description": "ISO date.",
+                    },
+                    "requisition_id": {"type": "string"},
+                },
+                "required": ["vendor_id", "amount"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "record_goods_receipt",
+            "description": "Record a goods receipt against an OPEN PO.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "po_id": {"type": "string"},
+                    "amount": {"type": "number"},
+                },
+                "required": ["po_id", "amount"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "close_po",
+            "description": "Close an OPEN purchase order.",
+            "parameters": {
+                "type": "object",
+                "properties": {"po_id": {"type": "string"}},
+                "required": ["po_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "cancel_po",
+            "description": "Cancel an OPEN purchase order.",
+            "parameters": {
+                "type": "object",
+                "properties": {"po_id": {"type": "string"}},
+                "required": ["po_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "cancel_requisition",
+            "description": "Cancel an OPEN requisition.",
+            "parameters": {
+                "type": "object",
+                "properties": {"requisition_id": {"type": "string"}},
+                "required": ["requisition_id"],
+            },
+        },
+    },
 ]
 
 SYSTEM_PROMPT = (
