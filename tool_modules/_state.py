@@ -330,6 +330,8 @@ def _seed_state() -> None:
                 "status": "ACTIVE",
                 "risk_tier": "LOW",
                 "currency": "USD",
+                "payment_terms": "NET30",
+                "lead_time_days": 7,
             },
             "VEND-002": {
                 "vendor_id": "VEND-002",
@@ -337,6 +339,8 @@ def _seed_state() -> None:
                 "status": "ACTIVE",
                 "risk_tier": "MEDIUM",
                 "currency": "USD",
+                "payment_terms": "NET45",
+                "lead_time_days": 14,
             },
             "VEND-003": {
                 "vendor_id": "VEND-003",
@@ -344,6 +348,8 @@ def _seed_state() -> None:
                 "status": "INACTIVE",
                 "risk_tier": "LOW",
                 "currency": "USD",
+                "payment_terms": "NET30",
+                "lead_time_days": 21,
             },
             "VEND-004": {
                 "vendor_id": "VEND-004",
@@ -351,6 +357,8 @@ def _seed_state() -> None:
                 "status": "ACTIVE",
                 "risk_tier": "HIGH",
                 "currency": "USD",
+                "payment_terms": "NET15",
+                "lead_time_days": 5,
             },
         }
     )
@@ -362,6 +370,8 @@ def _seed_state() -> None:
                 "amount": 12500.00,
                 "currency": "USD",
                 "status": PO_STATUS_OPEN,
+                "expected_delivery": "2024-01-20",
+                "requisition_id": "REQ-4001",
                 "created_at": _now(),
             },
             "PO-1002": {
@@ -370,6 +380,8 @@ def _seed_state() -> None:
                 "amount": 800.00,
                 "currency": "USD",
                 "status": PO_STATUS_OPEN,
+                "expected_delivery": "2024-02-10",
+                "requisition_id": None,
                 "created_at": _now(),
             },
         }
@@ -413,6 +425,36 @@ def _seed_state() -> None:
                 "status": "RECEIVED",
                 "receipt_ids": ["RCPT-3002"],
                 "due_date": "2024-02-29",
+                "created_at": _now(),
+                "updated_at": _now(),
+            },
+        }
+    )
+    _REQUISITIONS.update(
+        {
+            "REQ-4001": {
+                "requisition_id": "REQ-4001",
+                "description": "Hydraulic fittings, Q1 restock",
+                "vendor_id": "VEND-001",
+                "po_id": "PO-1001",
+                "quantity": 100,
+                "amount": 12500.00,
+                "currency": "USD",
+                "status": REQ_STATUS_CONVERTED,
+                "requested_by": "operator",
+                "created_at": _now(),
+                "updated_at": _now(),
+            },
+            "REQ-4002": {
+                "requisition_id": "REQ-4002",
+                "description": "Spare gaskets",
+                "vendor_id": None,
+                "po_id": None,
+                "quantity": 40,
+                "amount": 800.00,
+                "currency": "USD",
+                "status": REQ_STATUS_OPEN,
+                "requested_by": "operator",
                 "created_at": _now(),
                 "updated_at": _now(),
             },
