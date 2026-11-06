@@ -16,8 +16,9 @@ same reason: a listing needs the whole store, which is exactly the widening
 
 Authentication
 --------------
-Every endpoint except ``/health`` requires ``Authorization: Bearer <token>``.
-Three credentials exist and they are not interchangeable:
+Every endpoint except ``/health`` and ``/ready`` requires
+``Authorization: Bearer <token>``. Three credentials exist and they are not
+interchangeable:
 
 * ``PL_AGENT_TOKEN``    - role ``agent``.    ``/agent/run``.
 * ``PL_OPERATOR_TOKEN`` - role ``operator``. Invoice ingest, approval, and
@@ -58,6 +59,8 @@ in-band.
 Status mapping:
 
 * ``AUTH_MISSING`` / ``AUTH_INVALID`` -> 401, ``AUTH_FORBIDDEN`` -> 403.
+* ``RATE_LIMITED`` -> 429, with ``Retry-After`` set to the time until the
+  next token.
 * ``tools.ToolError`` -> ``_TOOL_ERROR_STATUS``, default 400.
 * Tool results that come back ``ok: false`` -> the same mapping, so
   ``GET /invoices/INV-NOPE`` is a 404 rather than a 200 carrying an error.
@@ -73,12 +76,39 @@ in middleware and stored on ``request.state``, so the dependency, the handlers
 and the body all agree on one value. A non-empty ``correlation_id`` in the JSON
 body still wins, for backwards compatibility with existing callers.
 
+Rate limiting
+-------------
+``_authenticate`` charges one token per request against a per-principal bucket
+(``PL_RATE_LIMIT_PER_MIN``, burst ``PL_RATE_LIMIT_BURST``). Keying on the
+authenticated principal rather than the client IP means a shared NAT does not
+starve one caller because another is busy, and a spoofed ``X-Forwarded-For``
+cannot buy a fresh budget.
+
+The limiter is in-process, which is correct only because the app is pinned to
+one worker (see Startup). With N workers each would enforce its own budget and
+the effective limit would be N times the configured one.
+
+Unauthenticated endpoints (``/health``, ``/ready``) are not limited: there is
+no principal to key on, and doing it by IP needs a proxy-trust decision that
+belongs with the deployment, not here.
+
 Startup
 -------
-``sandbox.preflight`` and ``preflight_auth`` run in the lifespan hook. The hook
-also takes an exclusive ``fcntl.flock`` on ``<AUDIT_LOG_PATH>.lock``: the audit
-chain is process-local, so a second worker would fork it. Run with
-``--workers 1``.
+The lifespan hook takes an exclusive ``fcntl.flock`` on
+``<AUDIT_LOG_PATH>.lock`` *first*, then runs ``sandbox.preflight`` and
+``preflight_auth``. The lock comes first so a second worker fails before it
+pays for the sandbox smoke test.
+
+The lock is the only thing pinning the process to one worker, and it has to
+be: ``tools._LOCK`` and the audit chain are process-local, so a second worker
+would fork the chain and interleave mutations. Run with ``--workers 1``. A
+misconfigured ``--workers N`` does not corrupt anything - the extra workers
+fail to boot - but uvicorn's supervisor will restart them, so the symptom is a
+crash loop rather than a forked chain. That is the intended trade: loud and
+harmless beats quiet and corrupting.
+
+If ``AUDIT_LOG_PATH`` is empty the lock is skipped and the single-worker
+guarantee is not enforced; a warning is logged at boot.
 """
 
 from __future__ import annotations
@@ -87,6 +117,10 @@ import datetime
 import fcntl
 import hmac
 import logging
+import math
+import os
+import threading
+import time
 import uuid
 from contextlib import asynccontextmanager
 from typing import Any, Dict, Optional
@@ -191,6 +225,93 @@ def preflight_auth() -> None:
                 )
 
 
+# ---------------------------------------------------------------------------
+# Rate limiting
+# ---------------------------------------------------------------------------
+
+
+class RateLimitError(Exception):
+    """Raised when a principal has spent its request budget."""
+
+    def __init__(self, retry_after: float) -> None:
+        super().__init__("RATE_LIMITED")
+        self.code = "RATE_LIMITED"
+        self.retry_after = retry_after
+
+
+class _TokenBucket:
+    """One principal's budget: ``capacity`` tokens, refilled continuously."""
+
+    __slots__ = ("capacity", "refill_per_s", "tokens", "updated")
+
+    def __init__(self, capacity: float, refill_per_s: float, now: float) -> None:
+        self.capacity = capacity
+        self.refill_per_s = refill_per_s
+        self.tokens = capacity
+        self.updated = now
+
+    def _refill(self, now: float) -> None:
+        elapsed = now - self.updated
+        if elapsed <= 0:
+            return
+        self.tokens = min(
+            self.capacity, self.tokens + elapsed * self.refill_per_s
+        )
+        self.updated = now
+
+    def take(self, now: float) -> bool:
+        self._refill(now)
+        if self.tokens >= 1.0:
+            self.tokens -= 1.0
+            return True
+        return False
+
+    def seconds_until_token(self, now: float) -> float:
+        self._refill(now)
+        if self.refill_per_s <= 0:
+            return 60.0
+        return max(0.0, (1.0 - self.tokens) / self.refill_per_s)
+
+
+class _RateLimiter:
+    """Per-principal token buckets, guarded by a lock.
+
+    The auth dependencies are sync functions, so FastAPI runs them in a
+    threadpool; the lock is what makes the bucket updates safe there.
+
+    ``_buckets`` is keyed by ``Principal.sub``, which is bounded by the number
+    of configured credentials, so it does not need eviction.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._buckets: Dict[str, _TokenBucket] = {}
+
+    def charge(self, key: str) -> Optional[float]:
+        """Spend one token. Returns ``None`` if allowed, else seconds to wait."""
+        per_min = config.PL_RATE_LIMIT_PER_MIN
+        if per_min <= 0:
+            return None
+        burst = max(1, config.PL_RATE_LIMIT_BURST)
+        now = time.monotonic()
+        with self._lock:
+            bucket = self._buckets.get(key)
+            if bucket is None:
+                bucket = _TokenBucket(float(burst), per_min / 60.0, now)
+                self._buckets[key] = bucket
+            if bucket.take(now):
+                return None
+            return bucket.seconds_until_token(now)
+
+    def reset(self) -> None:
+        """Drop every bucket. For tests that change the configured limits."""
+        with self._lock:
+            self._buckets.clear()
+
+
+_RATE_LIMITER = _RateLimiter()
+
+
 def _authenticate(authorization: Optional[str]) -> tools.Principal:
     """Resolve a bearer token to a Principal, or raise ``AuthError``.
 
@@ -198,6 +319,9 @@ def _authenticate(authorization: Optional[str]) -> tools.Principal:
     not reveal how much of a guessed token was correct. Both sides are encoded
     to bytes because ``hmac.compare_digest`` raises ``TypeError`` on non-ASCII
     ``str``.
+
+    The rate-limit charge happens after the match, so a wrong token cannot
+    spend a real principal's budget.
     """
     if not authorization or not authorization.strip():
         raise AuthError("AUTH_MISSING", "Authorization header is required")
@@ -214,6 +338,10 @@ def _authenticate(authorization: Optional[str]) -> tools.Principal:
 
     if matched is None:
         raise AuthError("AUTH_INVALID", "token not recognised")
+
+    retry_after = _RATE_LIMITER.charge(matched.sub)
+    if retry_after is not None:
+        raise RateLimitError(retry_after)
     return matched
 
 
@@ -266,17 +394,31 @@ def require_any(
 def _acquire_single_worker_lock() -> Optional[Any]:
     """Take an exclusive lock on ``<AUDIT_LOG_PATH>.lock``.
 
-    The audit chain is process-local, so two workers would fork it. ``flock``
-    is advisory but sufficient here: every ProcureLedger process takes the same
-    lock at boot, so a second worker fails fast instead of silently corrupting
-    the chain. Returns the open handle (to be released on shutdown), or
-    ``None`` when no audit log is configured.
+    The audit chain and ``tools._LOCK`` are process-local, so two workers would
+    fork the chain and interleave mutations. ``flock`` is advisory but
+    sufficient: every ProcureLedger process takes the same lock at boot, so a
+    second worker fails fast instead of silently corrupting the chain.
+
+    Returns the open handle (released on shutdown), or ``None`` when no audit
+    log is configured - in which case the single-worker guarantee is *not*
+    enforced and a warning is logged.
     """
     path = config.AUDIT_LOG_PATH
     if not path:
+        _LOG.warning(
+            "AUDIT_LOG_PATH is empty: the single-worker lock is disabled and "
+            "the audit chain is not protected from a second worker"
+        )
         return None
+
     lock_path = path + ".lock"
-    handle = open(lock_path, "a+", encoding="utf-8")
+    try:
+        handle = open(lock_path, "a+", encoding="utf-8")
+    except OSError as exc:
+        raise RuntimeError(
+            f"cannot open the audit lock file {lock_path}: {exc}"
+        ) from exc
+
     try:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
@@ -300,11 +442,15 @@ def _release_single_worker_lock(handle: Optional[Any]) -> None:
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     """Refuse to serve if this host cannot sandbox, authenticate, or is a
-    second worker."""
-    sandbox.preflight()
-    preflight_auth()
+    second worker.
+
+    The lock is taken first so a duplicate worker fails before it pays for the
+    sandbox smoke test in ``sandbox.preflight``.
+    """
     lock_handle = _acquire_single_worker_lock()
     try:
+        sandbox.preflight()
+        preflight_auth()
         yield
     finally:
         _release_single_worker_lock(lock_handle)
@@ -386,6 +532,7 @@ _HTTP_ERROR_CODES = {
     404: "NOT_FOUND",
     409: "CONFLICT",
     422: "VALIDATION_ERROR",
+    429: "RATE_LIMITED",
     503: "SERVICE_UNAVAILABLE",
 }
 
@@ -574,6 +721,22 @@ def handle_auth_error(request: Request, exc: AuthError) -> JSONResponse:
     )
 
 
+@app.exception_handler(RateLimitError)
+def handle_rate_limit(request: Request, exc: RateLimitError) -> JSONResponse:
+    """429 with ``Retry-After``, in the same envelope as every other failure.
+
+    ``Retry-After`` is computed from the bucket rather than hard-coded, so a
+    client that honours it retries when a token is actually available instead
+    of guessing.
+    """
+    retry_after = max(1, int(math.ceil(exc.retry_after)))
+    return JSONResponse(
+        status_code=429,
+        content=_error_body(exc.code, "request budget exhausted", _cid(request)),
+        headers={"Retry-After": str(retry_after)},
+    )
+
+
 @app.exception_handler(tools.ToolError)
 def handle_tool_error(request: Request, exc: tools.ToolError) -> JSONResponse:
     """Turn business/integrity errors into structured JSON, never a traceback."""
@@ -623,8 +786,16 @@ def handle_unexpected_error(request: Request, exc: Exception) -> JSONResponse:
     Without this, a ``KeyError`` in a handler produced Starlette's plain-text
     500 with no ``correlation_id`` and no ``ok`` field - a second response
     shape for the same class of failure, and one a client cannot parse.
+
+    The log line carries the correlation ID so the server-side traceback can be
+    tied to the response the client actually received.
     """
-    _LOG.exception("unhandled error on %s %s", request.method, request.url.path)
+    _LOG.exception(
+        "unhandled error on %s %s correlation_id=%s",
+        request.method,
+        request.url.path,
+        _cid(request),
+    )
     return JSONResponse(
         status_code=500,
         content=_error_body("INTERNAL_ERROR", _redact(500, str(exc)), _cid(request)),
@@ -693,6 +864,45 @@ def list_approvals() -> Dict[str, Any]:
         }
 
 # ---------------------------------------------------------------------------
+# Readiness
+# ---------------------------------------------------------------------------
+
+
+def _audit_space_problem() -> str:
+    """Return a reason the audit log cannot be appended to, or ``""``.
+
+    Mirrors the boot-time check in ``sandbox.preflight``. It is duplicated
+    rather than imported because ``sandbox`` keeps it private, and because the
+    two answer different questions: preflight asks "may we start?", the
+    readiness probe asks "can we still serve?". Keeping them independent means
+    a change to one cannot silently disable the other.
+    """
+    directory = os.path.dirname(os.path.abspath(config.AUDIT_LOG_PATH)) or "."
+    if not os.path.isdir(directory):
+        return f"audit log directory does not exist: {directory}"
+    if not os.access(directory, os.W_OK | os.X_OK):
+        return f"audit log directory is not writable: {directory}"
+
+    statvfs = getattr(os, "statvfs", None)
+    if statvfs is None:
+        # Non-POSIX host. bwrap is Linux-only, so this is unreachable in a
+        # deployment that got this far; skip rather than fail.
+        return ""
+    try:
+        stats = statvfs(directory)
+    except OSError as exc:
+        return f"cannot stat audit log filesystem {directory}: {exc}"
+
+    free = stats.f_bavail * stats.f_frsize
+    required = config.PL_AUDIT_MIN_FREE_MB * 1024 * 1024
+    if free < required:
+        return (
+            f"audit log filesystem {directory} has {free} bytes free, "
+            f"need at least {required}"
+        )
+    return ""
+
+# ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
 
@@ -700,6 +910,29 @@ def list_approvals() -> Dict[str, Any]:
 @app.get("/health")
 def health() -> Dict[str, Any]:
     """Unauthenticated liveness probe. Deliberately reveals nothing else."""
+    return {"ok": True}
+
+
+@app.get("/ready")
+def ready() -> Any:
+    """Unauthenticated readiness probe.
+
+    ``/health`` only proves the process is up. Readiness has to answer "can
+    this process still do its job?", and the one thing that can change after
+    boot is the audit log's filesystem: audit-before-mutation means a full
+    disk refuses every mutation. Re-checking free space here turns that into a
+    failed probe instead of a stream of 503s.
+
+    The reason is logged, not returned: it names a host path, and this
+    endpoint is unauthenticated.
+    """
+    problem = _audit_space_problem()
+    if problem:
+        _LOG.warning("readiness check failed: %s", problem)
+        return JSONResponse(
+            status_code=503,
+            content={"ok": False, "error": "NOT_READY"},
+        )
     return {"ok": True}
 
 

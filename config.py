@@ -18,6 +18,13 @@ AGENT_MAX_STEPS = int(os.environ.get("AGENT_MAX_STEPS", "8"))
 
 AUDIT_LOG_PATH = os.environ.get("AUDIT_LOG_PATH", "audit_log.jsonl")
 
+# Minimum free space (MiB) required on the filesystem holding the audit log.
+# ``sandbox.preflight`` refuses to boot below this, and ``app./ready`` re-checks
+# it on every probe. Audit-before-mutation means a failed append refuses the
+# mutation, so a full disk stops the service; it is better to stop at boot with
+# a clear message than mid-request with an OSError.
+PL_AUDIT_MIN_FREE_MB = int(os.environ.get("PL_AUDIT_MIN_FREE_MB", "64"))
+
 # Audit-log recovery policy when the durable chain is unreadable or fails
 # verification at boot.
 #
@@ -39,6 +46,17 @@ SANDBOX_LIMITS = {
     "memory_mb": int(os.environ.get("SANDBOX_MEMORY_MB", "256")),
     "wall_clock_s": int(os.environ.get("SANDBOX_WALL_CLOCK_S", "10")),
 }
+
+# Per-principal request budget. ``PL_RATE_LIMIT_PER_MIN`` is the sustained
+# rate; ``PL_RATE_LIMIT_BURST`` is the bucket depth, i.e. how many requests may
+# arrive back-to-back before the sustained rate applies. Set
+# ``PL_RATE_LIMIT_PER_MIN`` to 0 to disable limiting.
+#
+# The limiter is in-process, which is correct only because the app is pinned to
+# one worker (see ``app._acquire_single_worker_lock``). With N workers each
+# would enforce its own budget and the effective limit would be N times this.
+PL_RATE_LIMIT_PER_MIN = int(os.environ.get("PL_RATE_LIMIT_PER_MIN", "120"))
+PL_RATE_LIMIT_BURST = int(os.environ.get("PL_RATE_LIMIT_BURST", "20"))
 
 # ---------------------------------------------------------------------------
 # Authentication
