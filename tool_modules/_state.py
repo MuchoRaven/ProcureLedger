@@ -4,8 +4,10 @@ tool_modules/_state.py
 Shared state, audit chain and commit primitives for ProcureLedger.
 
 This module is the single source of truth for module-level state. It must not
-import from ``tools`` or any other ``tool_modules`` submodule, so it can be
-imported first without creating a cycle.
+import from ``tools`` or any other ``tool_modules`` submodule at import time,
+so it can be imported first without creating a cycle. ``_resolve_persist``
+imports ``tools`` lazily, at call time, purely to honour the
+``tools._persist_audit`` test seam.
 
 Layout
 ------
@@ -13,7 +15,7 @@ Layout
 * ``ToolError`` and ``Principal``.
 * Module-level state dictionaries and the re-entrant lock that guards them.
 * Time, hashing and audit-chain helpers.
-* ``_transition`` / ``_commit`` primitives used by the domain tools.
+* ``_check_transition`` / ``_transition`` / ``_commit`` primitives.
 * ``_recover_audit_state`` (called at import) and ``_reset_state`` (test hook).
 """
 
@@ -56,6 +58,8 @@ _RESERVED_EVENT_TYPES = frozenset(
         "REQUISITION_CREATED",
         "REQUISITION_STATUS_CHANGED",
         "THREE_WAY_MATCH",
+        "TOOL_CALL_STARTED",
+        "TOOL_CALL_COMPLETED",
     }
 )
 
@@ -67,10 +71,10 @@ _RESERVED_EVENT_TYPES = frozenset(
 class ToolError(Exception):
     """Domain error carrying a stable machine-readable code."""
 
-    def __init__(self, code: str, detail: Optional[Dict[str, Any]] = None):
+    def __init__(self, code: str, detail: Optional[Any] = None):
         super().__init__(code)
         self.code = code
-        self.detail = detail or {}
+        self.detail = detail if detail is not None else {}
 
     def __str__(self) -> str:  # pragma: no cover - cosmetic
         if self.detail:
@@ -163,6 +167,17 @@ def _load_audit_from_file() -> List[Dict[str, Any]]:
     return entries
 
 
+def _audit_entries() -> List[Dict[str, Any]]:
+    """Return a snapshot of the in-memory audit chain.
+
+    Read through this helper rather than importing ``_AUDIT`` directly:
+    ``_reset_state`` and ``_recover_audit_state`` rebind the module global, so
+    a name imported into another module would go stale.
+    """
+    with _LOCK:
+        return [dict(entry) for entry in _AUDIT]
+
+
 def _persist_audit_entry(entry: Dict[str, Any]) -> None:
     """Append one entry to the durable audit log."""
     path = _audit_log_path()
@@ -173,13 +188,35 @@ def _persist_audit_entry(entry: Dict[str, Any]) -> None:
         raise ToolError("AUDIT_LOG_UNWRITABLE", {"path": path, "error": str(exc)})
 
 
+def _resolve_persist() -> Callable[[Dict[str, Any]], None]:
+    """Return the function ``_append_audit`` should use to write one entry.
+
+    ``tools`` re-exports ``_persist_audit_entry`` as ``_persist_audit`` so the
+    test suite can monkeypatch ``tools._persist_audit`` to simulate a disk
+    failure. Resolving the attribute at call time - rather than binding it at
+    import - is what makes that patch effective. The fallback keeps ``_state``
+    usable on its own (for example inside the sandbox worker).
+    """
+    try:
+        import tools as _tools
+    except Exception:
+        return _persist_audit_entry
+    candidate = getattr(_tools, "_persist_audit", None)
+    return candidate if callable(candidate) else _persist_audit_entry
+
+
 def _append_audit(
     event_type: str,
     payload: Dict[str, Any],
     correlation_id: str = "",
     source: str = "agent",
 ) -> Dict[str, Any]:
-    """Append an entry to the in-memory and durable audit chain."""
+    """Append an entry to the in-memory and durable audit chain.
+
+    The durable write happens first: if it fails, ``ToolError`` propagates and
+    neither the in-memory chain nor ``_AUDIT_SEQ`` advances, so a caller that
+    treats the failure as fatal leaves no partial state behind.
+    """
     global _AUDIT_SEQ
     with _LOCK:
         seq = _AUDIT_SEQ + 1
@@ -194,7 +231,7 @@ def _append_audit(
         }
         entry["hash"] = _compute_hash(entry)
         # Persist first: if the write fails we must not advance in-memory state.
-        _persist_audit_entry(entry)
+        _resolve_persist()(entry)
         _AUDIT.append(entry)
         _AUDIT_SEQ = seq
         return entry
@@ -205,17 +242,16 @@ def _append_audit(
 # ---------------------------------------------------------------------------
 
 
-def _transition(
+def _check_transition(
     invoice_id: str,
     from_states: Tuple[str, ...],
     to_state: str,
-    correlation_id: str = "",
 ) -> None:
-    """Move an invoice to ``to_state`` if its current state is allowed.
+    """Validate an invoice transition without changing anything.
 
-    Raises ``ToolError`` on an unknown invoice or an illegal transition. This
-    is the only fallible step in the ``_commit`` mutations, so callers run it
-    first and leave no partial state behind on failure.
+    Raises ``ToolError`` on an unknown invoice or an illegal transition. Split
+    out from ``_transition`` so ``_commit`` can reject a bad transition before
+    it writes an audit link for it.
     """
     with _LOCK:
         invoice = _INVOICES.get(invoice_id)
@@ -232,6 +268,22 @@ def _transition(
                     "to": to_state,
                 },
             )
+
+
+def _transition(
+    invoice_id: str,
+    from_states: Tuple[str, ...],
+    to_state: str,
+    correlation_id: str = "",
+) -> None:
+    """Move an invoice to ``to_state`` if its current state is allowed.
+
+    Re-validates under the lock so a caller that already ran
+    ``_check_transition`` cannot race a concurrent change.
+    """
+    with _LOCK:
+        _check_transition(invoice_id, from_states, to_state)
+        invoice = _INVOICES[invoice_id]
         invoice["status"] = to_state
         invoice["updated_at"] = _now()
 
@@ -241,16 +293,23 @@ def _commit(
     event_type: str,
     payload: Dict[str, Any],
     correlation_id: str = "",
+    check: Optional[Callable[[], None]] = None,
 ) -> Dict[str, Any]:
-    """Run ``mutation`` and append the matching audit event atomically.
+    """Validate, record, then mutate - in that order.
 
-    The mutation is expected to perform its fallible step first (usually
-    ``_transition``), so a raised ``ToolError`` leaves no partial state. The
-    audit event is only written after the mutation succeeds.
+    The audit link is written *before* the mutation so a failed audit write
+    leaves business state untouched (audit-before-mutation). ``check`` runs
+    first and performs the mutation's fallible validation without changing
+    anything, so an illegal transition is rejected before an audit entry is
+    written for it. ``mutation`` is therefore expected to be infallible once
+    ``check`` has passed.
     """
     with _LOCK:
+        if check is not None:
+            check()
+        entry = _append_audit(event_type, payload, correlation_id, source="tool")
         mutation()
-        return _append_audit(event_type, payload, correlation_id, source="tool")
+        return entry
 
 
 # ---------------------------------------------------------------------------
@@ -265,29 +324,29 @@ def _seed_state() -> None:
     """Populate the in-memory state with the baseline dataset."""
     _VENDORS.update(
         {
-            "V-1001": {
-                "vendor_id": "V-1001",
+            "VEND-001": {
+                "vendor_id": "VEND-001",
                 "name": "Acme Industrial Supply",
                 "status": "ACTIVE",
                 "risk_tier": "LOW",
                 "currency": "USD",
             },
-            "V-1002": {
-                "vendor_id": "V-1002",
+            "VEND-002": {
+                "vendor_id": "VEND-002",
                 "name": "Globex Components",
                 "status": "ACTIVE",
                 "risk_tier": "MEDIUM",
                 "currency": "USD",
             },
-            "V-1003": {
-                "vendor_id": "V-1003",
+            "VEND-003": {
+                "vendor_id": "VEND-003",
                 "name": "Initech Logistics",
                 "status": "INACTIVE",
                 "risk_tier": "LOW",
                 "currency": "USD",
             },
-            "V-1004": {
-                "vendor_id": "V-1004",
+            "VEND-004": {
+                "vendor_id": "VEND-004",
                 "name": "Umbrella Risk Partners",
                 "status": "ACTIVE",
                 "risk_tier": "HIGH",
@@ -297,21 +356,65 @@ def _seed_state() -> None:
     )
     _POS.update(
         {
-            "PO-2001": {
-                "po_id": "PO-2001",
-                "vendor_id": "V-1001",
-                "amount": 1500.00,
+            "PO-1001": {
+                "po_id": "PO-1001",
+                "vendor_id": "VEND-001",
+                "amount": 12500.00,
                 "currency": "USD",
                 "status": PO_STATUS_OPEN,
                 "created_at": _now(),
             },
-            "PO-2002": {
-                "po_id": "PO-2002",
-                "vendor_id": "V-1002",
+            "PO-1002": {
+                "po_id": "PO-1002",
+                "vendor_id": "VEND-002",
                 "amount": 800.00,
                 "currency": "USD",
                 "status": PO_STATUS_OPEN,
                 "created_at": _now(),
+            },
+        }
+    )
+    _RECEIPTS.update(
+        {
+            "RCPT-3001": {
+                "receipt_id": "RCPT-3001",
+                "po_id": "PO-1001",
+                "amount": 12500.00,
+                "received_at": _now(),
+            },
+            "RCPT-3002": {
+                "receipt_id": "RCPT-3002",
+                "po_id": "PO-1002",
+                "amount": 800.00,
+                "received_at": _now(),
+            },
+        }
+    )
+    _INVOICES.update(
+        {
+            "INV-2001": {
+                "invoice_id": "INV-2001",
+                "vendor_id": "VEND-001",
+                "po_id": "PO-1001",
+                "amount": 12500.00,
+                "currency": "USD",
+                "status": "RECEIVED",
+                "receipt_ids": ["RCPT-3001"],
+                "due_date": "2024-01-31",
+                "created_at": _now(),
+                "updated_at": _now(),
+            },
+            "INV-2002": {
+                "invoice_id": "INV-2002",
+                "vendor_id": "VEND-002",
+                "po_id": "PO-1002",
+                "amount": 800.00,
+                "currency": "USD",
+                "status": "RECEIVED",
+                "receipt_ids": ["RCPT-3002"],
+                "due_date": "2024-02-29",
+                "created_at": _now(),
+                "updated_at": _now(),
             },
         }
     )
