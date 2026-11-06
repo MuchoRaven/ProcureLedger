@@ -110,7 +110,7 @@ def _snapshot_for(
 
     * ``invoice_id``     -> invoice, its PO, its vendor, its receipts,
                             its approvals
-    * ``po_id``          -> PO, its vendor
+    * ``po_id``          -> PO, its vendor, its receipts
     * ``vendor_id``      -> vendor
     * ``requisition_id`` -> requisition, its vendor, its PO
     * ``receipt_id``     -> receipt, its PO, that PO's vendor
@@ -145,6 +145,13 @@ def _snapshot_for(
             if pid and pid in _POS and pid not in pos:
                 pos[pid] = dict(_POS[pid])
                 add_vendor(_POS[pid].get("vendor_id"))
+                # Pull in the PO's receipts so a receipt-recording decider can
+                # see what has already been received against this PO. Safe
+                # against recursion: ``pos[pid]`` is set above, so the nested
+                # ``add_po(pid)`` from ``add_receipt`` returns immediately.
+                for rid, rec in _RECEIPTS.items():
+                    if rec.get("po_id") == pid:
+                        add_receipt(rid)
 
         def add_receipt(rid: Optional[str]) -> None:
             if rid and rid in _RECEIPTS and rid not in receipts:
