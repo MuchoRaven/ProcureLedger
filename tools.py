@@ -10,9 +10,12 @@ app-layer only.
 
 App-layer only (never exposed to the model)
 -------------------------------------------
-* ``ingest_invoice``  - creates invoice records from the ERP feed.
-* ``approve_payout``  - records a human approval decision.
-* ``_execute_payout`` - settles an approved payout. Private on purpose.
+* ``ingest_invoice``         - creates invoice records from the ERP feed.
+* ``create_purchase_order``  - creates PO records from the ERP feed.
+* ``update_po_status``       - moves a PO out of ``OPEN`` (close/cancel).
+* ``record_goods_receipt``   - records a goods receipt against an open PO.
+* ``approve_payout``         - records a human approval decision.
+* ``_execute_payout``        - settles an approved payout. Private on purpose.
 
 Sandbox support
 ---------------
@@ -34,12 +37,12 @@ Persistence and replay
 ``config.AUDIT_LOG_PATH`` (``audit_log.jsonl``) is the source of truth for the
 audit chain. Every link is appended as one canonical JSON object per line and
 ``fsync``-ed before the tool call returns. On import, ``_recover_audit_state``
-loads that file back into memory *and replays it* to rebuild ``_INVOICES`` and
-``_APPROVALS``. The chain is durable; the dicts it describes are not, so
-without replay a restart resets every invoice to ``RECEIVED`` and a paid
-invoice can be matched and paid again. Replay is at-least-once and safe
-because every transition is status-guarded: a link that would move an invoice
-backwards is skipped with a warning rather than applied.
+loads that file back into memory *and replays it* to rebuild ``_INVOICES``,
+``_APPROVALS``, ``_POS`` and ``_RECEIPTS``. The chain is durable; the dicts it
+describes are not, so without replay a restart resets every invoice to
+``RECEIVED`` and a paid invoice can be matched and paid again. Replay is
+at-least-once and safe because every transition is status-guarded: a link that
+would move an invoice backwards is skipped with a warning rather than applied.
 
 ``verify_audit_chain`` re-verifies the on-disk chain by default
 (``from_file=True``); pass ``from_file=False`` to check the in-memory copy
@@ -81,7 +84,7 @@ import os
 import threading
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Any, Callable, Dict, FrozenSet, List, Optional, Tuple
 
 import config
@@ -94,6 +97,13 @@ _LOG = logging.getLogger(__name__)
 
 GENESIS_HASH = "0" * 64
 AMOUNT_TOLERANCE = 0.01
+
+# Purchase-order lifecycle. A PO is created ``OPEN`` and may only be moved out
+# of ``OPEN`` (to ``CLOSED`` or ``CANCELLED``) by ``update_po_status``.
+PO_STATUS_OPEN = "OPEN"
+PO_STATUS_CLOSED = "CLOSED"
+PO_STATUS_CANCELLED = "CANCELLED"
+_PO_ALLOWED_TARGETS = frozenset({PO_STATUS_CLOSED, PO_STATUS_CANCELLED})
 
 # ---------------------------------------------------------------------------
 # Errors
@@ -145,6 +155,9 @@ class Principal:
 _RESERVED_EVENT_TYPES = frozenset(
     {
         "INVOICE_INGESTED",
+        "PO_CREATED",
+        "PO_STATUS_UPDATED",
+        "GOODS_RECEIPT_RECORDED",
         "THREE_WAY_MATCH",
         "PAYOUT_APPROVAL_REQUESTED",
         "PAYOUT_APPROVED",
@@ -184,13 +197,16 @@ _VENDORS: Dict[str, Dict[str, Any]] = {
     },
 }
 
-_POS: Dict[str, Dict[str, Any]] = {
+# Seed purchase orders. ``_POS`` is the live, mutable store; ``_SEED_POS`` is
+# the immutable literal that ``_reset_business_state`` restores.
+_SEED_POS: Dict[str, Dict[str, Any]] = {
     "PO-1001": {
         "po_id": "PO-1001",
         "vendor_id": "VEND-001",
         "amount": 12500.00,
         "currency": "USD",
         "status": "OPEN",
+        "expected_delivery_date": "2024-05-10",
     },
     "PO-1002": {
         "po_id": "PO-1002",
@@ -198,6 +214,7 @@ _POS: Dict[str, Dict[str, Any]] = {
         "amount": 8000.00,
         "currency": "USD",
         "status": "OPEN",
+        "expected_delivery_date": "2024-05-12",
     },
     "PO-1003": {
         "po_id": "PO-1003",
@@ -205,10 +222,14 @@ _POS: Dict[str, Dict[str, Any]] = {
         "amount": 3000.00,
         "currency": "USD",
         "status": "OPEN",
+        "expected_delivery_date": "2024-05-15",
     },
 }
 
-_RECEIPTS: Dict[str, Dict[str, Any]] = {
+_POS: Dict[str, Dict[str, Any]] = {k: dict(v) for k, v in _SEED_POS.items()}
+
+# Seed goods receipts, keyed by ``po_id`` (one receipt per PO in this model).
+_SEED_RECEIPTS: Dict[str, Dict[str, Any]] = {
     "PO-1001": {
         "po_id": "PO-1001",
         "amount": 12500.00,
@@ -225,6 +246,8 @@ _RECEIPTS: Dict[str, Dict[str, Any]] = {
         "received_at": "2024-05-04T14:15:00Z",
     },
 }
+
+_RECEIPTS: Dict[str, Dict[str, Any]] = {k: dict(v) for k, v in _SEED_RECEIPTS.items()}
 
 _INVOICES: Dict[str, Dict[str, Any]] = {
     "INV-2001": {
@@ -281,6 +304,17 @@ def _now() -> str:
         .isoformat(timespec="milliseconds")
         .replace("+00:00", "Z")
     )
+
+
+def _valid_date(value: Any) -> bool:
+    """True if ``value`` is a non-empty ISO ``YYYY-MM-DD`` date string."""
+    if not isinstance(value, str) or not value.strip():
+        return False
+    try:
+        date.fromisoformat(value.strip())
+    except ValueError:
+        return False
+    return True
 
 
 def _canonical(obj: Any) -> str:
@@ -493,7 +527,10 @@ def _commit(
 
 
 def _reset_business_state() -> None:
-    """Restore invoices/approvals to the seed literals. Caller holds ``_LOCK``."""
+    """Restore invoices/approvals/POs/receipts to the seed literals.
+
+    Caller holds ``_LOCK``.
+    """
     _APPROVALS.clear()
     for invoice_id in list(_INVOICES.keys()):
         if invoice_id not in _SEED_INVOICE_IDS:
@@ -501,6 +538,11 @@ def _reset_business_state() -> None:
     for invoice in _INVOICES.values():
         invoice["status"] = "RECEIVED"
         invoice["updated_at"] = invoice["created_at"]
+
+    _POS.clear()
+    _POS.update({k: dict(v) for k, v in _SEED_POS.items()})
+    _RECEIPTS.clear()
+    _RECEIPTS.update({k: dict(v) for k, v in _SEED_RECEIPTS.items()})
 
 
 def _replay_ingest(payload: Dict[str, Any], ts: str) -> None:
@@ -527,6 +569,83 @@ def _replay_ingest(payload: Dict[str, Any], ts: str) -> None:
         "status": "RECEIVED",
         "created_at": ts,
         "updated_at": ts,
+    }
+
+
+def _replay_po_created(payload: Dict[str, Any], ts: str) -> None:
+    po_id = payload.get("po_id")
+    vendor_id = payload.get("vendor_id")
+    amount = payload.get("amount")
+    expected = payload.get("expected_delivery_date")
+    if not isinstance(po_id, str) or not po_id:
+        _fail("AUDIT_LOG_CORRUPT", "PO_CREATED missing po_id")
+    if po_id in _POS:
+        return
+    if not isinstance(vendor_id, str) or not vendor_id:
+        _fail("AUDIT_LOG_CORRUPT", f"PO_CREATED {po_id} missing vendor_id")
+    if isinstance(amount, bool) or not isinstance(amount, (int, float)):
+        _fail("AUDIT_LOG_CORRUPT", f"PO_CREATED {po_id} bad amount")
+    if not isinstance(expected, str) or not expected:
+        _fail(
+            "AUDIT_LOG_CORRUPT",
+            f"PO_CREATED {po_id} missing expected_delivery_date",
+        )
+    _POS[po_id] = {
+        "po_id": po_id,
+        "vendor_id": vendor_id,
+        "amount": float(amount),
+        "currency": payload.get("currency") or "USD",
+        "status": PO_STATUS_OPEN,
+        "expected_delivery_date": expected,
+    }
+
+
+def _replay_po_status_updated(payload: Dict[str, Any], ts: str) -> None:
+    po_id = payload.get("po_id")
+    status = payload.get("status")
+    if not isinstance(po_id, str) or not po_id:
+        _fail("AUDIT_LOG_CORRUPT", "PO_STATUS_UPDATED missing po_id")
+    if status not in _PO_ALLOWED_TARGETS:
+        _fail("AUDIT_LOG_CORRUPT", f"PO_STATUS_UPDATED {po_id} bad status")
+    po = _POS.get(po_id)
+    if po is None:
+        _fail("AUDIT_LOG_CORRUPT", f"PO_STATUS_UPDATED for unknown PO {po_id}")
+    if po["status"] != PO_STATUS_OPEN:
+        _LOG.warning(
+            "replay: skipping PO_STATUS_UPDATED for %s; status is %s",
+            po_id,
+            po["status"],
+        )
+        return
+    po["status"] = status
+
+
+def _replay_goods_receipt(payload: Dict[str, Any], ts: str) -> None:
+    po_id = payload.get("po_id")
+    amount = payload.get("amount")
+    if not isinstance(po_id, str) or not po_id:
+        _fail("AUDIT_LOG_CORRUPT", "GOODS_RECEIPT_RECORDED missing po_id")
+    if isinstance(amount, bool) or not isinstance(amount, (int, float)):
+        _fail("AUDIT_LOG_CORRUPT", f"GOODS_RECEIPT_RECORDED {po_id} bad amount")
+    if po_id in _RECEIPTS:
+        return
+    po = _POS.get(po_id)
+    if po is None:
+        _fail("AUDIT_LOG_CORRUPT", f"GOODS_RECEIPT_RECORDED for unknown PO {po_id}")
+    if po["status"] != PO_STATUS_OPEN:
+        _LOG.warning(
+            "replay: skipping GOODS_RECEIPT_RECORDED for %s; status is %s",
+            po_id,
+            po["status"],
+        )
+        return
+    received_at = payload.get("received_at")
+    if not isinstance(received_at, str) or not received_at:
+        received_at = ts
+    _RECEIPTS[po_id] = {
+        "po_id": po_id,
+        "amount": float(amount),
+        "received_at": received_at,
     }
 
 
@@ -674,6 +793,12 @@ def _replay_audit_entries(entries: List[Dict[str, Any]]) -> None:
         ts = entry.get("ts") or _now()
         if event_type == "INVOICE_INGESTED":
             _replay_ingest(payload, ts)
+        elif event_type == "PO_CREATED":
+            _replay_po_created(payload, ts)
+        elif event_type == "PO_STATUS_UPDATED":
+            _replay_po_status_updated(payload, ts)
+        elif event_type == "GOODS_RECEIPT_RECORDED":
+            _replay_goods_receipt(payload, ts)
         elif event_type == "THREE_WAY_MATCH":
             _replay_match(payload, ts)
         elif event_type == "PAYOUT_APPROVAL_REQUESTED":
@@ -756,7 +881,8 @@ def _reset_state() -> None:
     """Test hook: clear approvals and the audit chain, keep seed records.
 
     Invoices added by ``ingest_invoice`` are removed so a test that ingests
-    does not leak into the next test.
+    does not leak into the next test. POs and receipts are restored to their
+    seed literals for the same reason.
     """
     global _AUDIT_SEQ, _AUDIT_RECOVERY_ERROR
     with _LOCK:
@@ -1185,6 +1311,177 @@ def ingest_invoice(
             correlation_id,
         )
         return {"ok": True, "invoice": dict(invoice)}
+
+
+def create_purchase_order(
+    po_id: str,
+    vendor_id: str,
+    amount: float,
+    expected_delivery_date: str,
+    currency: str = "USD",
+    correlation_id: str = "",
+) -> Dict[str, Any]:
+    """Create a purchase order from the ERP feed.
+
+    The PO starts ``OPEN``. ``expected_delivery_date`` must be an ISO
+    ``YYYY-MM-DD`` date string. App-layer only: never exposed to the model.
+    """
+    if not isinstance(po_id, str) or not po_id.strip():
+        return {"ok": False, "error": "INVALID_PO_ID"}
+    if isinstance(amount, bool) or not isinstance(amount, (int, float)):
+        return {"ok": False, "error": "INVALID_AMOUNT", "amount": amount}
+    if amount <= 0:
+        return {"ok": False, "error": "INVALID_AMOUNT", "amount": amount}
+    if not _valid_date(expected_delivery_date):
+        return {
+            "ok": False,
+            "error": "INVALID_EXPECTED_DELIVERY_DATE",
+            "expected_delivery_date": expected_delivery_date,
+        }
+
+    clean_po_id = po_id.strip()
+    clean_date = expected_delivery_date.strip()
+
+    with _LOCK:
+        if clean_po_id in _POS:
+            return {"ok": False, "error": "PO_EXISTS", "po_id": clean_po_id}
+        if vendor_id not in _VENDORS:
+            return {"ok": False, "error": "VENDOR_NOT_FOUND", "vendor_id": vendor_id}
+
+        po: Dict[str, Any] = {
+            "po_id": clean_po_id,
+            "vendor_id": vendor_id,
+            "amount": float(amount),
+            "currency": currency or "USD",
+            "status": PO_STATUS_OPEN,
+            "expected_delivery_date": clean_date,
+        }
+
+        def mutation() -> None:
+            _POS[clean_po_id] = po
+
+        _commit(
+            mutation,
+            "PO_CREATED",
+            {
+                "po_id": clean_po_id,
+                "vendor_id": vendor_id,
+                "amount": po["amount"],
+                "currency": po["currency"],
+                "expected_delivery_date": clean_date,
+            },
+            correlation_id,
+        )
+        return {"ok": True, "po": dict(po)}
+
+
+def update_po_status(
+    po_id: str,
+    new_status: str,
+    correlation_id: str = "",
+) -> Dict[str, Any]:
+    """Move a PO out of ``OPEN`` (to ``CLOSED`` or ``CANCELLED``).
+
+    Only a PO whose current status is ``OPEN`` can be updated; this is the
+    "update PO status from OPEN" gate. App-layer only: never exposed to the
+    model.
+    """
+    if not isinstance(po_id, str) or not po_id.strip():
+        return {"ok": False, "error": "INVALID_PO_ID"}
+    if not isinstance(new_status, str) or not new_status.strip():
+        return {"ok": False, "error": "INVALID_STATUS"}
+    clean_status = new_status.strip().upper()
+    if clean_status not in _PO_ALLOWED_TARGETS:
+        return {
+            "ok": False,
+            "error": "INVALID_STATUS",
+            "status": clean_status,
+            "allowed": sorted(_PO_ALLOWED_TARGETS),
+        }
+
+    with _LOCK:
+        po = _POS.get(po_id)
+        if po is None:
+            return {"ok": False, "error": "PO_NOT_FOUND", "po_id": po_id}
+        if po["status"] != PO_STATUS_OPEN:
+            return {
+                "ok": False,
+                "error": "PO_NOT_OPEN",
+                "po_id": po_id,
+                "status": po["status"],
+            }
+
+        def mutation() -> None:
+            po["status"] = clean_status
+
+        _commit(
+            mutation,
+            "PO_STATUS_UPDATED",
+            {"po_id": po_id, "status": clean_status},
+            correlation_id,
+        )
+        return {"ok": True, "po": dict(po)}
+
+
+def record_goods_receipt(
+    po_id: str,
+    amount: float,
+    received_at: str = "",
+    correlation_id: str = "",
+) -> Dict[str, Any]:
+    """Record a goods receipt against an ``OPEN`` PO.
+
+    One receipt per PO in this model (matching ``run_three_way_match``), so a
+    second receipt for the same PO is rejected with ``RECEIPT_EXISTS``.
+    ``received_at`` defaults to the current UTC timestamp. App-layer only:
+    never exposed to the model.
+    """
+    if not isinstance(po_id, str) or not po_id.strip():
+        return {"ok": False, "error": "INVALID_PO_ID"}
+    if isinstance(amount, bool) or not isinstance(amount, (int, float)):
+        return {"ok": False, "error": "INVALID_AMOUNT", "amount": amount}
+    if amount <= 0:
+        return {"ok": False, "error": "INVALID_AMOUNT", "amount": amount}
+
+    with _LOCK:
+        po = _POS.get(po_id)
+        if po is None:
+            return {"ok": False, "error": "PO_NOT_FOUND", "po_id": po_id}
+        if po["status"] != PO_STATUS_OPEN:
+            return {
+                "ok": False,
+                "error": "PO_NOT_OPEN",
+                "po_id": po_id,
+                "status": po["status"],
+            }
+        if po_id in _RECEIPTS:
+            return {"ok": False, "error": "RECEIPT_EXISTS", "po_id": po_id}
+
+        received = (
+            received_at.strip()
+            if isinstance(received_at, str) and received_at.strip()
+            else _now()
+        )
+        receipt: Dict[str, Any] = {
+            "po_id": po_id,
+            "amount": float(amount),
+            "received_at": received,
+        }
+
+        def mutation() -> None:
+            _RECEIPTS[po_id] = receipt
+
+        _commit(
+            mutation,
+            "GOODS_RECEIPT_RECORDED",
+            {
+                "po_id": po_id,
+                "amount": receipt["amount"],
+                "received_at": received,
+            },
+            correlation_id,
+        )
+        return {"ok": True, "receipt": dict(receipt)}
 
 
 def approve_payout(
