@@ -28,6 +28,12 @@ model):
 * ``close_po(po_id, correlation_id="")`` / ``cancel_po(po_id,
   correlation_id="")``
 * ``get_po(po_id)`` / ``get_requisition(requisition_id)``
+* ``create_rfq(description, quantity, currency, vendor_ids, due_date,
+  correlation_id)`` / ``submit_quote(rfq_id, vendor_id, unit_price, currency,
+  lead_time_days, valid_until, correlation_id)``
+* ``close_rfq(rfq_id, correlation_id)`` / ``cancel_rfq(rfq_id,
+  correlation_id)`` / ``award_quote(rfq_id, quote_id, correlation_id)``
+* ``get_rfq(rfq_id)`` / ``get_quote(quote_id)`` / ``list_quotes(rfq_id)``
 
 Listing tools (``list_pos`` / ``list_requisitions``) deliberately live in
 ``app.py``, not here: they need the whole store, which is exactly the widening
@@ -62,16 +68,32 @@ in ``tool_modules._state`` because the Phase 0 change is scoped to
 ``_reset_phase0_state`` does. Moving them into ``_state`` (and teaching
 ``_reset_state`` about them) is the follow-up that removes that caveat.
 
-The error codes the new tools will raise are declared as constants below, so
-the apply helpers in later phases and ``app._TOOL_ERROR_STATUS`` cannot drift
-on a typo. Nothing raises them yet: Phase 0 is plumbing only.
+The error codes the Phase 0 and Phase 1 tools raise are declared as constants
+below, so the apply helpers and ``app._TOOL_ERROR_STATUS`` cannot drift on a
+typo.
+
+Phase 1 (RFQs and quotes)
+-------------------------
+``create_rfq`` / ``submit_quote`` / ``close_rfq`` / ``cancel_rfq`` /
+``award_quote`` and the read helpers ``get_rfq`` / ``get_quote`` /
+``list_quotes`` are app-layer only: they are not in
+``decisions.PROPOSAL_KINDS``, so the model cannot reach them. They follow the
+same contract as the rest of the control plane - validate under ``_LOCK``,
+write the audit link before the mutation, and generate IDs/timestamps only in
+the apply step.
+
+``award_quote`` creates its PO through the existing ``create_po`` path so the
+award lands in ``_POS`` and inherits the ``PO_CREATED`` audit entry. The PO is
+created first and the RFQ/quote status change is committed second; if the
+second commit fails the PO is left behind (retryable) rather than an awarded
+quote with no PO.
 """
 
 from __future__ import annotations
 
 import math
 import uuid
-from datetime import date
+from datetime import date, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 import decisions
@@ -176,6 +198,28 @@ PHASE0_ERROR_CODES = frozenset(
         REQUISITION_ALREADY_CONVERTED,
     }
 )
+
+
+# ---------------------------------------------------------------------------
+# Phase 1 status values
+# ---------------------------------------------------------------------------
+#
+# Constants rather than bare strings so the apply helpers, the read helpers and
+# the tests cannot drift on a typo.
+
+RFQ_STATUS_OPEN = "OPEN"
+RFQ_STATUS_CLOSED = "CLOSED"
+RFQ_STATUS_CANCELLED = "CANCELLED"
+RFQ_STATUS_AWARDED = "AWARDED"
+
+QUOTE_STATUS_SUBMITTED = "SUBMITTED"
+QUOTE_STATUS_WITHDRAWN = "WITHDRAWN"
+QUOTE_STATUS_AWARDED = "AWARDED"
+QUOTE_STATUS_REJECTED = "REJECTED"
+
+# A quote is "live" while it can still be awarded; only these statuses block a
+# second quote from the same vendor on the same RFQ.
+_LIVE_QUOTE_STATUSES = (QUOTE_STATUS_SUBMITTED, QUOTE_STATUS_AWARDED)
 
 
 def _utc_today() -> str:
@@ -1592,3 +1636,529 @@ def verify_audit_chain(from_file: bool = True) -> Dict[str, Any]:
         prev = entry.get("hash", prev)
 
     return {"ok": True, "valid": True, "entries": len(entries)}
+
+
+# ---------------------------------------------------------------------------
+# Phase 1: RFQs and quotes (app-layer only)
+# ---------------------------------------------------------------------------
+#
+# None of these are in ``decisions.PROPOSAL_KINDS``, so the model cannot reach
+# them. They follow the same contract as the rest of the control plane:
+# validate under ``_LOCK``, write the audit link before the mutation, and
+# generate IDs/timestamps only in the apply step.
+
+
+def _check_create_rfq(vendor_ids: List[str]) -> None:
+    """Validate an RFQ-creation request without changing anything.
+
+    Every named vendor must exist, be ACTIVE and not be HIGH risk. Run under
+    ``_LOCK`` so a vendor that went inactive after the request was formed is
+    rejected before an audit link is written for it.
+    """
+    with _LOCK:
+        for vid in vendor_ids:
+            vendor = _VENDORS.get(vid)
+            if vendor is None:
+                raise ToolError("VENDOR_NOT_FOUND", {"vendor_id": vid})
+            if vendor.get("status") != "ACTIVE":
+                raise ToolError(
+                    "VENDOR_INACTIVE",
+                    {"vendor_id": vid, "status": vendor.get("status")},
+                )
+            if vendor.get("risk_tier") == "HIGH":
+                raise ToolError("VENDOR_HIGH_RISK", {"vendor_id": vid})
+
+
+def create_rfq(
+    description: str,
+    quantity: Any,
+    currency: str,
+    vendor_ids: Any,
+    due_date: str = "",
+    correlation_id: str = "",
+) -> Dict[str, Any]:
+    """Open a request for quotes. App-layer only; never reachable by the model.
+
+    Validates the arguments, then re-checks every vendor under ``_LOCK`` in
+    ``_check_create_rfq`` before the ``RFQ_CREATED`` audit link is written, so
+    a vendor that went inactive cannot be quoted against.
+    """
+    if not isinstance(description, str) or not description.strip():
+        return {
+            "ok": False,
+            "error": "MALFORMED_PROPOSAL",
+            "detail": "description",
+        }
+    description = description.strip()
+    if not isinstance(quantity, (int, float)) or isinstance(quantity, bool):
+        return {"ok": False, "error": "MALFORMED_PROPOSAL", "detail": "quantity"}
+    quantity = float(quantity)
+    if not math.isfinite(quantity) or quantity <= 0:
+        return {"ok": False, "error": "MALFORMED_PROPOSAL", "detail": "quantity"}
+    if not isinstance(currency, str) or not currency.strip():
+        return {"ok": False, "error": "MALFORMED_PROPOSAL", "detail": "currency"}
+    currency = currency.strip()
+    if isinstance(vendor_ids, str) or not isinstance(vendor_ids, (list, tuple)):
+        return {
+            "ok": False,
+            "error": "MALFORMED_PROPOSAL",
+            "detail": "vendor_ids",
+        }
+    cleaned: List[str] = []
+    for vid in vendor_ids:
+        if not isinstance(vid, str) or not vid.strip():
+            return {
+                "ok": False,
+                "error": "MALFORMED_PROPOSAL",
+                "detail": "vendor_ids",
+            }
+        vid = vid.strip()
+        if vid not in cleaned:
+            cleaned.append(vid)
+    if not cleaned:
+        return {
+            "ok": False,
+            "error": "MALFORMED_PROPOSAL",
+            "detail": "vendor_ids",
+        }
+    if due_date is None:
+        due_date = ""
+    if not isinstance(due_date, str):
+        return {"ok": False, "error": "MALFORMED_PROPOSAL", "detail": "due_date"}
+    due_date = due_date.strip()
+    if due_date:
+        try:
+            due_date = date.fromisoformat(due_date).isoformat()
+        except ValueError:
+            return {
+                "ok": False,
+                "error": "INVALID_ARGUMENTS",
+                "detail": "due_date is not an ISO date",
+            }
+
+    rfq_id = "RFQ-" + uuid.uuid4().hex[:8].upper()
+    now = _now()
+    record = {
+        "rfq_id": rfq_id,
+        "description": description,
+        "quantity": quantity,
+        "currency": currency,
+        "vendor_ids": list(cleaned),
+        "due_date": due_date,
+        "status": RFQ_STATUS_OPEN,
+        "created_at": now,
+        "created_by": "operator",
+        "correlation_id": correlation_id,
+        "updated_at": now,
+    }
+
+    def mutation() -> None:
+        with _LOCK:
+            _RFQS[rfq_id] = record
+
+    payload = {
+        "rfq_id": rfq_id,
+        "description": description,
+        "quantity": quantity,
+        "currency": currency,
+        "vendor_ids": list(cleaned),
+        "due_date": due_date,
+    }
+
+    try:
+        _commit(
+            mutation,
+            "RFQ_CREATED",
+            payload,
+            correlation_id,
+            check=lambda: _check_create_rfq(cleaned),
+        )
+    except ToolError as exc:
+        return {"ok": False, "error": exc.code, "detail": exc.detail}
+
+    return {"ok": True, "rfq": dict(record)}
+
+
+def _check_submit_quote(
+    rfq_id: str, vendor_id: str, currency: str, valid_until: str
+) -> None:
+    """Validate a quote submission without changing anything.
+
+    The guards are the ones that can race: the RFQ must still be OPEN, the
+    vendor must still be on the RFQ, the currency must still match, the quote
+    must not already be expired, and the vendor must not already have a live
+    quote on this RFQ.
+    """
+    with _LOCK:
+        rfq = _RFQS.get(rfq_id)
+        if rfq is None:
+            raise ToolError(RFQ_NOT_FOUND, {"rfq_id": rfq_id})
+        if rfq.get("status") != RFQ_STATUS_OPEN:
+            raise ToolError(RFQ_NOT_OPEN, {"status": rfq.get("status")})
+        if vendor_id not in (rfq.get("vendor_ids") or []):
+            raise ToolError(
+                QUOTE_VENDOR_MISMATCH,
+                {"rfq_id": rfq_id, "vendor_id": vendor_id},
+            )
+        if currency != rfq.get("currency"):
+            raise ToolError(
+                QUOTE_CURRENCY_MISMATCH,
+                {"currency": currency, "rfq_currency": rfq.get("currency")},
+            )
+        today = _utc_today()
+        if valid_until and valid_until < today:
+            raise ToolError(
+                QUOTE_EXPIRED, {"valid_until": valid_until, "as_of": today}
+            )
+        for quote in _QUOTES.values():
+            if (
+                quote.get("rfq_id") == rfq_id
+                and quote.get("vendor_id") == vendor_id
+                and quote.get("status") in _LIVE_QUOTE_STATUSES
+            ):
+                raise ToolError(
+                    QUOTE_EXISTS, {"quote_id": quote.get("quote_id")}
+                )
+
+
+def submit_quote(
+    rfq_id: str,
+    vendor_id: str,
+    unit_price: Any,
+    currency: str,
+    lead_time_days: Any,
+    valid_until: str,
+    correlation_id: str = "",
+) -> Dict[str, Any]:
+    """Submit a vendor quote against an OPEN RFQ. App-layer only.
+
+    The guards (RFQ OPEN, vendor on the RFQ, currency match, not expired, one
+    live quote per vendor) live in ``_check_submit_quote`` and run under
+    ``_LOCK`` before the ``QUOTE_SUBMITTED`` audit link is written.
+    """
+    if not isinstance(rfq_id, str) or not rfq_id.strip():
+        return {"ok": False, "error": "MALFORMED_PROPOSAL", "detail": "rfq_id"}
+    rfq_id = rfq_id.strip()
+    if not isinstance(vendor_id, str) or not vendor_id.strip():
+        return {"ok": False, "error": "MALFORMED_PROPOSAL", "detail": "vendor_id"}
+    vendor_id = vendor_id.strip()
+    if not isinstance(unit_price, (int, float)) or isinstance(unit_price, bool):
+        return {
+            "ok": False,
+            "error": "MALFORMED_PROPOSAL",
+            "detail": "unit_price",
+        }
+    unit_price = float(unit_price)
+    if not math.isfinite(unit_price) or unit_price <= 0:
+        return {
+            "ok": False,
+            "error": "MALFORMED_PROPOSAL",
+            "detail": "unit_price",
+        }
+    if not isinstance(currency, str) or not currency.strip():
+        return {"ok": False, "error": "MALFORMED_PROPOSAL", "detail": "currency"}
+    currency = currency.strip()
+    if not isinstance(lead_time_days, (int, float)) or isinstance(
+        lead_time_days, bool
+    ):
+        return {
+            "ok": False,
+            "error": "MALFORMED_PROPOSAL",
+            "detail": "lead_time_days",
+        }
+    if not math.isfinite(float(lead_time_days)) or lead_time_days < 0:
+        return {
+            "ok": False,
+            "error": "MALFORMED_PROPOSAL",
+            "detail": "lead_time_days",
+        }
+    if float(lead_time_days) != int(lead_time_days):
+        return {
+            "ok": False,
+            "error": "MALFORMED_PROPOSAL",
+            "detail": "lead_time_days",
+        }
+    lead_time_days = int(lead_time_days)
+    if not isinstance(valid_until, str) or not valid_until.strip():
+        return {
+            "ok": False,
+            "error": "MALFORMED_PROPOSAL",
+            "detail": "valid_until",
+        }
+    valid_until = valid_until.strip()
+    try:
+        valid_until = date.fromisoformat(valid_until).isoformat()
+    except ValueError:
+        return {
+            "ok": False,
+            "error": "INVALID_ARGUMENTS",
+            "detail": "valid_until is not an ISO date",
+        }
+
+    quote_id = "QTE-" + uuid.uuid4().hex[:8].upper()
+    now = _now()
+    record = {
+        "quote_id": quote_id,
+        "rfq_id": rfq_id,
+        "vendor_id": vendor_id,
+        "unit_price": unit_price,
+        "currency": currency,
+        "lead_time_days": lead_time_days,
+        "valid_until": valid_until,
+        "status": QUOTE_STATUS_SUBMITTED,
+        "submitted_at": now,
+        "correlation_id": correlation_id,
+        "updated_at": now,
+    }
+
+    def mutation() -> None:
+        with _LOCK:
+            _QUOTES[quote_id] = record
+
+    payload = {
+        "quote_id": quote_id,
+        "rfq_id": rfq_id,
+        "vendor_id": vendor_id,
+        "unit_price": unit_price,
+        "currency": currency,
+        "lead_time_days": lead_time_days,
+        "valid_until": valid_until,
+    }
+
+    try:
+        _commit(
+            mutation,
+            "QUOTE_SUBMITTED",
+            payload,
+            correlation_id,
+            check=lambda: _check_submit_quote(
+                rfq_id, vendor_id, currency, valid_until
+            ),
+        )
+    except ToolError as exc:
+        return {"ok": False, "error": exc.code, "detail": exc.detail}
+
+    return {"ok": True, "quote": dict(record)}
+
+
+def _apply_rfq_status(
+    rfq_id: str, to_status: str, event_type: str, correlation_id: str
+) -> Dict[str, Any]:
+    """Close or cancel an OPEN RFQ.
+
+    Only ``CLOSED`` and ``CANCELLED`` are accepted. The check re-reads the RFQ
+    under ``_LOCK`` so a request that raced with an award cannot close an RFQ
+    that has already moved on.
+    """
+    if not isinstance(rfq_id, str) or not rfq_id.strip():
+        return {"ok": False, "error": "MALFORMED_PROPOSAL", "detail": "rfq_id"}
+    rfq_id = rfq_id.strip()
+    if to_status not in (RFQ_STATUS_CLOSED, RFQ_STATUS_CANCELLED):
+        return {"ok": False, "error": "MALFORMED_PROPOSAL", "detail": "to_status"}
+
+    def check() -> None:
+        with _LOCK:
+            rfq = _RFQS.get(rfq_id)
+            if rfq is None:
+                raise ToolError(RFQ_NOT_FOUND, {"rfq_id": rfq_id})
+            if rfq.get("status") != RFQ_STATUS_OPEN:
+                raise ToolError(RFQ_NOT_OPEN, {"status": rfq.get("status")})
+
+    def mutation() -> None:
+        with _LOCK:
+            rfq = _RFQS[rfq_id]
+            rfq["status"] = to_status
+            rfq["updated_at"] = _now()
+
+    payload = {"rfq_id": rfq_id, "from": RFQ_STATUS_OPEN, "to": to_status}
+
+    try:
+        _commit(mutation, event_type, payload, correlation_id, check=check)
+    except ToolError as exc:
+        return {"ok": False, "error": exc.code, "detail": exc.detail}
+
+    with _LOCK:
+        return {"ok": True, "rfq": dict(_RFQS[rfq_id])}
+
+
+def close_rfq(rfq_id: str, correlation_id: str = "") -> Dict[str, Any]:
+    """Close an OPEN RFQ so no further quotes are accepted. App-layer only."""
+    return _apply_rfq_status(
+        rfq_id, RFQ_STATUS_CLOSED, "RFQ_CLOSED", correlation_id
+    )
+
+
+def cancel_rfq(rfq_id: str, correlation_id: str = "") -> Dict[str, Any]:
+    """Cancel an OPEN RFQ. App-layer only."""
+    return _apply_rfq_status(
+        rfq_id, RFQ_STATUS_CANCELLED, "RFQ_CANCELLED", correlation_id
+    )
+
+
+def get_rfq(rfq_id: str) -> Dict[str, Any]:
+    """Return an RFQ record, or ``RFQ_NOT_FOUND``. App-layer only."""
+    if not isinstance(rfq_id, str) or not rfq_id:
+        return {
+            "ok": False,
+            "error": "INVALID_ARGUMENTS",
+            "detail": "rfq_id must be a non-empty string",
+        }
+    with _LOCK:
+        rfq = _RFQS.get(rfq_id)
+        if rfq is None:
+            return {"ok": False, "error": RFQ_NOT_FOUND, "detail": rfq_id}
+        return {"ok": True, "rfq": dict(rfq)}
+
+
+def get_quote(quote_id: str) -> Dict[str, Any]:
+    """Return a quote record, or ``QUOTE_NOT_FOUND``. App-layer only."""
+    if not isinstance(quote_id, str) or not quote_id:
+        return {
+            "ok": False,
+            "error": "INVALID_ARGUMENTS",
+            "detail": "quote_id must be a non-empty string",
+        }
+    with _LOCK:
+        quote = _QUOTES.get(quote_id)
+        if quote is None:
+            return {"ok": False, "error": QUOTE_NOT_FOUND, "detail": quote_id}
+        return {"ok": True, "quote": dict(quote)}
+
+
+def list_quotes(rfq_id: str) -> Dict[str, Any]:
+    """Return every quote on an RFQ, ordered by ``quote_id``. App-layer only.
+
+    Reports a missing RFQ in-band rather than returning an empty list, so a
+    typo in the ID is distinguishable from an RFQ with no quotes yet.
+    """
+    if not isinstance(rfq_id, str) or not rfq_id:
+        return {
+            "ok": False,
+            "error": "INVALID_ARGUMENTS",
+            "detail": "rfq_id must be a non-empty string",
+        }
+    with _LOCK:
+        if rfq_id not in _RFQS:
+            return {"ok": False, "error": RFQ_NOT_FOUND, "detail": rfq_id}
+        quotes = [
+            dict(quote)
+            for quote in _QUOTES.values()
+            if quote.get("rfq_id") == rfq_id
+        ]
+    quotes.sort(key=lambda q: q.get("quote_id") or "")
+    return {"ok": True, "rfq_id": rfq_id, "quotes": quotes}
+
+
+def award_quote(
+    rfq_id: str, quote_id: str, correlation_id: str = ""
+) -> Dict[str, Any]:
+    """Award an RFQ to one SUBMITTED quote and raise the resulting PO.
+
+    App-layer only. The PO is created through the existing ``create_po`` path
+    so it lands in ``_POS`` and inherits the ``PO_CREATED`` audit entry; the
+    RFQ/quote status change is then committed as ``QUOTE_AWARDED``. The PO is
+    created first on purpose: if the second commit fails, the PO is left
+    behind (retryable) rather than an awarded quote with no PO.
+
+    ``expected_delivery`` on the PO is derived from the quote's
+    ``lead_time_days``; the PO amount is ``quantity * unit_price``.
+    """
+    if not isinstance(rfq_id, str) or not rfq_id.strip():
+        return {"ok": False, "error": "MALFORMED_PROPOSAL", "detail": "rfq_id"}
+    rfq_id = rfq_id.strip()
+    if not isinstance(quote_id, str) or not quote_id.strip():
+        return {"ok": False, "error": "MALFORMED_PROPOSAL", "detail": "quote_id"}
+    quote_id = quote_id.strip()
+
+    def check() -> None:
+        with _LOCK:
+            rfq = _RFQS.get(rfq_id)
+            if rfq is None:
+                raise ToolError(RFQ_NOT_FOUND, {"rfq_id": rfq_id})
+            if rfq.get("status") != RFQ_STATUS_OPEN:
+                raise ToolError(RFQ_NOT_OPEN, {"status": rfq.get("status")})
+            quote = _QUOTES.get(quote_id)
+            if quote is None or quote.get("rfq_id") != rfq_id:
+                raise ToolError(
+                    QUOTE_NOT_FOUND, {"rfq_id": rfq_id, "quote_id": quote_id}
+                )
+            if quote.get("status") != QUOTE_STATUS_SUBMITTED:
+                raise ToolError(
+                    QUOTE_NOT_SUBMITTED, {"status": quote.get("status")}
+                )
+
+    # Pre-validate so a bad award never creates a PO.
+    try:
+        check()
+    except ToolError as exc:
+        return {"ok": False, "error": exc.code, "detail": exc.detail}
+
+    with _LOCK:
+        rfq = _RFQS[rfq_id]
+        quote = _QUOTES[quote_id]
+        quantity = _as_float(rfq.get("quantity"))
+        unit_price = _as_float(quote.get("unit_price"))
+        vendor_id = quote.get("vendor_id")
+        currency = quote.get("currency") or rfq.get("currency")
+        lead_time_days = int(_as_float(quote.get("lead_time_days")))
+
+    amount = round(quantity * unit_price, 2)
+    expected_delivery = ""
+    if lead_time_days:
+        expected_delivery = (
+            date.fromisoformat(_utc_today()) + timedelta(days=lead_time_days)
+        ).isoformat()
+
+    po_result = create_po(
+        vendor_id=vendor_id,
+        amount=amount,
+        currency=currency,
+        expected_delivery=expected_delivery,
+        correlation_id=correlation_id,
+    )
+    if not po_result.get("ok"):
+        return po_result
+    po_id = po_result["po"]["po_id"]
+
+    def mutation() -> None:
+        with _LOCK:
+            rfq = _RFQS[rfq_id]
+            quote = _QUOTES[quote_id]
+            stamp = _now()
+            quote["status"] = QUOTE_STATUS_AWARDED
+            quote["awarded_at"] = stamp
+            quote["updated_at"] = stamp
+            rfq["status"] = RFQ_STATUS_AWARDED
+            rfq["awarded_quote_id"] = quote_id
+            rfq["po_id"] = po_id
+            rfq["updated_at"] = stamp
+            for other_id, other in _QUOTES.items():
+                if (
+                    other_id != quote_id
+                    and other.get("rfq_id") == rfq_id
+                    and other.get("status") == QUOTE_STATUS_SUBMITTED
+                ):
+                    other["status"] = QUOTE_STATUS_REJECTED
+                    other["updated_at"] = stamp
+
+    payload = {
+        "rfq_id": rfq_id,
+        "quote_id": quote_id,
+        "po_id": po_id,
+        "vendor_id": vendor_id,
+        "amount": amount,
+        "currency": currency,
+    }
+
+    try:
+        _commit(mutation, "QUOTE_AWARDED", payload, correlation_id, check=check)
+    except ToolError as exc:
+        return {"ok": False, "error": exc.code, "detail": exc.detail}
+
+    with _LOCK:
+        return {
+            "ok": True,
+            "rfq": dict(_RFQS[rfq_id]),
+            "quote": dict(_QUOTES[quote_id]),
+            "po": dict(_POS[po_id]),
+        }
