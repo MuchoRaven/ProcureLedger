@@ -336,32 +336,114 @@ def _append_audit(
 # ---------------------------------------------------------------------------
 
 
-def _check_transition(
-    invoice_id: str,
+@dataclass(frozen=True)
+class _EntitySpec:
+    """Describes one transitionable record type.
+
+    ``store`` is a callable rather than the dict itself so the spec keeps
+    pointing at the live store after ``_reset_state`` clears it, and so a test
+    that rebinds a module global is still observed.
+    """
+
+    store: Callable[[], Dict[str, Dict[str, Any]]]
+    id_field: str
+    not_found_code: str
+    status_field: str = "status"
+    updated_field: str = "updated_at"
+
+
+_ENTITIES: Dict[str, _EntitySpec] = {
+    "invoice": _EntitySpec(
+        store=lambda: _INVOICES,
+        id_field="invoice_id",
+        not_found_code="INVOICE_NOT_FOUND",
+    ),
+    "po": _EntitySpec(
+        store=lambda: _POS,
+        id_field="po_id",
+        not_found_code="PO_NOT_FOUND",
+    ),
+    "requisition": _EntitySpec(
+        store=lambda: _REQUISITIONS,
+        id_field="requisition_id",
+        not_found_code="REQUISITION_NOT_FOUND",
+    ),
+}
+
+
+def _entity_spec(entity: str) -> _EntitySpec:
+    """Look up an entity spec, raising a stable code for an unknown name."""
+    spec = _ENTITIES.get(entity)
+    if spec is None:
+        raise ToolError("UNKNOWN_ENTITY", {"entity": entity})
+    return spec
+
+
+def _check_entity_transition(
+    entity: str,
+    entity_id: str,
     from_states: Tuple[str, ...],
     to_state: str,
 ) -> None:
-    """Validate an invoice transition without changing anything.
+    """Validate a transition for any registered entity without changing it.
 
-    Raises ``ToolError`` on an unknown invoice or an illegal transition. Split
-    out from ``_transition`` so ``_commit`` can reject a bad transition before
-    it writes an audit link for it.
+    One implementation for invoices, POs and requisitions. The previous
+    invoice-only helper forced ``tools._apply_transition`` to re-implement the
+    same checks for the other two record types, and the copies could drift.
+
+    Raises ``ToolError`` on an unknown entity or record, or an illegal
+    transition. Split out from ``_transition_entity`` so ``_commit`` can reject
+    a bad transition before it writes an audit link for it.
     """
+    spec = _entity_spec(entity)
     with _LOCK:
-        invoice = _INVOICES.get(invoice_id)
-        if invoice is None:
-            raise ToolError("INVOICE_NOT_FOUND", {"invoice_id": invoice_id})
-        current = invoice.get("status")
+        record = spec.store().get(entity_id)
+        if record is None:
+            raise ToolError(spec.not_found_code, {spec.id_field: entity_id})
+        current = record.get(spec.status_field)
         if current not in from_states:
             raise ToolError(
                 "INVALID_TRANSITION",
                 {
-                    "invoice_id": invoice_id,
+                    "entity": entity,
+                    spec.id_field: entity_id,
                     "from": current,
                     "allowed": list(from_states),
                     "to": to_state,
                 },
             )
+
+
+def _transition_entity(
+    entity: str,
+    entity_id: str,
+    from_states: Tuple[str, ...],
+    to_state: str,
+) -> None:
+    """Move any registered entity to ``to_state`` if its state allows it.
+
+    Re-validates under the lock so a caller that already ran
+    ``_check_entity_transition`` cannot race a concurrent change.
+    """
+    spec = _entity_spec(entity)
+    with _LOCK:
+        _check_entity_transition(entity, entity_id, from_states, to_state)
+        record = spec.store()[entity_id]
+        record[spec.status_field] = to_state
+        record[spec.updated_field] = _now()
+
+
+def _check_transition(
+    invoice_id: str,
+    from_states: Tuple[str, ...],
+    to_state: str,
+) -> None:
+    """Invoice-specific wrapper kept for existing callers.
+
+    Delegates to ``_check_entity_transition`` so there is exactly one
+    implementation of the check.
+    """
+    _check_entity_transition("invoice", invoice_id, from_states, to_state)
 
 
 def _transition(
@@ -370,16 +452,12 @@ def _transition(
     to_state: str,
     correlation_id: str = "",
 ) -> None:
-    """Move an invoice to ``to_state`` if its current state is allowed.
+    """Invoice-specific wrapper kept for existing callers.
 
-    Re-validates under the lock so a caller that already ran
-    ``_check_transition`` cannot race a concurrent change.
+    Delegates to ``_transition_entity`` so there is exactly one implementation
+    of the mutation.
     """
-    with _LOCK:
-        _check_transition(invoice_id, from_states, to_state)
-        invoice = _INVOICES[invoice_id]
-        invoice["status"] = to_state
-        invoice["updated_at"] = _now()
+    _transition_entity("invoice", invoice_id, from_states, to_state)
 
 
 def _commit(

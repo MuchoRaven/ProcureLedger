@@ -21,16 +21,16 @@ Containment properties
 ----------------------
 * No network: ``bwrap --unshare-all`` includes ``--unshare-net``.
 * No secrets: ``--clearenv`` then a minimal ``--setenv`` allowlist. The
-  request envelope carries business data only.
+   request envelope carries business data only.
 * Read-only root: ``--ro-bind`` for ``/usr``, ``/lib``, ``/lib64``, and the
-  app directory. The only writable paths are ``/tmp`` and ``/workspace``,
-  both tmpfs.
+   app directory. The only writable paths are ``/tmp`` and ``/workspace``,
+   both tmpfs.
 * Resource caps: ``prlimit --as`` for address space, ``--nofile`` and
-  ``--nproc`` for file and process counts, ``--core=0`` to suppress dumps.
-  Wall clock is enforced by ``subprocess.run(timeout=...)``.
+   ``--nproc`` for file and process counts, ``--core=0`` to suppress dumps.
+   Wall clock is enforced by ``subprocess.run(timeout=...)``.
 * Lifecycle: bwrap creates a fresh tmpfs ``/workspace`` per run and
-  ``--die-with-parent`` tears it down with the process. No reuse, no warm
-  pool, and nothing to clean up on the host.
+   ``--die-with-parent`` tears it down with the process. No reuse, no warm
+   pool, and nothing to clean up on the host.
 
 Error detail
 ------------
@@ -304,7 +304,14 @@ def _apply(
 ) -> Dict[str, Any]:
     kind = proposal.get("kind")
     if kind == "read":
-        return {"ok": True, **proposal.get("data", {})}
+        data = proposal.get("data", {})
+        if not isinstance(data, dict):
+            return {"ok": False, "error": "MALFORMED_PROPOSAL", "kind": kind}
+        # ``ok`` is written last so a ``data`` key named ``ok`` (or ``error``)
+        # cannot turn a read into a success the control plane did not decide.
+        result = dict(data)
+        result["ok"] = True
+        return result
     if kind == "transition":
         return tools._apply_transition(proposal, correlation_id)
     if kind == "create_approval":
