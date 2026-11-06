@@ -18,6 +18,19 @@ AGENT_MAX_STEPS = int(os.environ.get("AGENT_MAX_STEPS", "8"))
 
 AUDIT_LOG_PATH = os.environ.get("AUDIT_LOG_PATH", "audit_log.jsonl")
 
+# Audit-log recovery policy when the durable chain is unreadable or fails
+# verification at boot.
+#
+# ``fail`` (default) refuses to start. A tampered or truncated chain is an
+# integrity failure, and continuing would fork it: the next append would write
+# ``seq=1`` with ``prev_hash=GENESIS_HASH`` on top of a file that already holds
+# entries, producing duplicate sequence numbers and a broken link.
+#
+# ``quarantine`` moves the bad file aside, starts a fresh chain, and records a
+# ``CHAIN_RESET`` entry naming the quarantine path. Use it to recover a host
+# without hand-editing the log; the reset is itself auditable.
+PL_AUDIT_RECOVERY = os.environ.get("PL_AUDIT_RECOVERY", "fail").strip().lower()
+
 # Sandbox resource caps. Consumed by ``sandbox._bwrap_command`` (``memory_mb``)
 # and ``sandbox._spawn`` (``wall_clock_s``). Parsed at import so a malformed
 # value fails fast at boot instead of surfacing as an ``AttributeError`` on the

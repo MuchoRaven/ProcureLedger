@@ -44,7 +44,8 @@ approved as someone else. The executor recorded on
 
 Error contract
 --------------
-Every failure - auth, validation, business, integrity - returns one envelope::
+Every failure - auth, validation, business, integrity, or an unexpected
+exception - returns one envelope::
 
     {"ok": false, "error": CODE, "detail": str, "correlation_id": str}
 
@@ -62,6 +63,7 @@ Status mapping:
   ``GET /invoices/INV-NOPE`` is a 404 rather than a 200 carrying an error.
 * Agent client/model init failures -> 503.
 * Agent step-cap exhaustion -> 200 with ``ok: false``; the run completed.
+* Anything unhandled -> 500 ``INTERNAL_ERROR``, still in the envelope.
 
 Correlation IDs
 ---------------
@@ -81,8 +83,10 @@ chain is process-local, so a second worker would fork it. Run with
 
 from __future__ import annotations
 
+import datetime
 import fcntl
 import hmac
+import logging
 import uuid
 from contextlib import asynccontextmanager
 from typing import Any, Dict, Optional
@@ -96,6 +100,8 @@ import agent
 import config
 import sandbox
 import tools
+
+_LOG = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Authentication
@@ -121,6 +127,10 @@ def _principals() -> Dict[str, tools.Principal]:
     Rebuilt per call rather than cached at import so a test can monkeypatch
     ``config`` without reloading the module. Empty tokens are omitted, which is
     why ``preflight_auth`` must run before the app serves traffic.
+
+    ``auth_method`` is set explicitly so the sandbox request envelope and the
+    audit trail record how the caller authenticated, rather than falling back
+    to ``"service"`` for every credential.
     """
     table: Dict[str, tools.Principal] = {}
     agent_token = (config.PL_AGENT_TOKEN or "").strip()
@@ -129,17 +139,23 @@ def _principals() -> Dict[str, tools.Principal]:
 
     if agent_token:
         table[agent_token] = tools.Principal(
-            sub="agent", roles=frozenset({ROLE_AGENT})
+            sub="agent",
+            roles=frozenset({ROLE_AGENT}),
+            auth_method="bearer",
         )
     if operator_token:
         name = (config.PL_OPERATOR_NAME or "operator").strip() or "operator"
         table[operator_token] = tools.Principal(
-            sub=name, roles=frozenset({ROLE_OPERATOR})
+            sub=name,
+            roles=frozenset({ROLE_OPERATOR}),
+            auth_method="bearer",
         )
     if executor_token:
         name = (config.PL_EXECUTOR_NAME or "executor").strip() or "executor"
         table[executor_token] = tools.Principal(
-            sub=name, roles=frozenset({ROLE_EXECUTOR})
+            sub=name,
+            roles=frozenset({ROLE_EXECUTOR}),
+            auth_method="bearer",
         )
     return table
 
@@ -320,6 +336,10 @@ async def correlation_middleware(request: Request, call_next):
 # module works unchanged on both pydantic v1 and v2.
 Amount = confloat(strict=True, gt=0)
 
+# Same constraints for a count. ``quantity`` was a bare ``float``, so a
+# negative or boolean quantity passed validation and reached the store.
+Quantity = confloat(strict=True, gt=0)
+
 # Agent errors that mean "the deployment is broken", not "the run finished".
 _AGENT_FATAL_ERRORS = {"CLIENT_INIT_FAILED", "MODEL_CALL_FAILED"}
 
@@ -327,6 +347,10 @@ _AGENT_FATAL_ERRORS = {"CLIENT_INIT_FAILED", "MODEL_CALL_FAILED"}
 _TOOL_ERROR_STATUS = {
     "AUDIT_LOG_CORRUPT": 503,
     "AUDIT_LOG_UNREADABLE": 503,
+    # ``_persist_audit_entry`` raises this when the append fails. It was
+    # unmapped, so a disk failure on audit write surfaced as a 400 - a client
+    # error for a server-side outage.
+    "AUDIT_LOG_UNWRITABLE": 503,
     "AUDIT_WRITE_FAILED": 503,
     "INVOICE_NOT_FOUND": 404,
     "APPROVAL_NOT_FOUND": 404,
@@ -407,7 +431,7 @@ class CreatePORequest(BaseModel):
 
 class CreateRequisitionRequest(BaseModel):
     description: str
-    quantity: float
+    quantity: Quantity
     amount: Amount
     vendor_id: str = ""
     currency: str = "USD"
@@ -460,6 +484,26 @@ def _resolve_correlation_id(header_value: str, body_value: str) -> str:
     if body:
         return body
     return header_value
+
+
+def _validate_iso_date(value: str, field: str) -> str:
+    """Return ``value`` if it is an ISO date, or raise a 400.
+
+    ``expected_delivery`` was an unvalidated ``str``, so a malformed date was
+    stored and would break any later delay computation. An empty value is
+    allowed and means "not scheduled".
+    """
+    text = (value or "").strip()
+    if not text:
+        return ""
+    try:
+        datetime.date.fromisoformat(text)
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{field} must be an ISO date (YYYY-MM-DD)",
+        )
+    return text
 
 # ---------------------------------------------------------------------------
 # Error handling
@@ -571,6 +615,21 @@ def handle_validation_error(
         content=_error_body("VALIDATION_ERROR", "; ".join(parts), _cid(request)),
     )
 
+
+@app.exception_handler(Exception)
+def handle_unexpected_error(request: Request, exc: Exception) -> JSONResponse:
+    """Last-resort handler so an unhandled exception still returns the envelope.
+
+    Without this, a ``KeyError`` in a handler produced Starlette's plain-text
+    500 with no ``correlation_id`` and no ``ok`` field - a second response
+    shape for the same class of failure, and one a client cannot parse.
+    """
+    _LOG.exception("unhandled error on %s %s", request.method, request.url.path)
+    return JSONResponse(
+        status_code=500,
+        content=_error_body("INTERNAL_ERROR", _redact(500, str(exc)), _cid(request)),
+    )
+
 # ---------------------------------------------------------------------------
 # App-layer listings
 # ---------------------------------------------------------------------------
@@ -599,6 +658,37 @@ def list_requisitions() -> Dict[str, Any]:
             "ok": True,
             "requisitions": [
                 dict(req) for _, req in sorted(tools._REQUISITIONS.items())
+            ],
+        }
+
+
+def list_invoices() -> Dict[str, Any]:
+    """Return every invoice, sorted by ID. App-layer only.
+
+    Without this an approver had to know an invoice ID out of band to find
+    anything to act on; ``GET /invoices/{id}`` alone cannot answer "what is
+    waiting for me?".
+    """
+    with tools._LOCK:
+        return {
+            "ok": True,
+            "invoices": [
+                dict(inv) for _, inv in sorted(tools._INVOICES.items())
+            ],
+        }
+
+
+def list_approvals() -> Dict[str, Any]:
+    """Return every payout approval, sorted by ID. App-layer only.
+
+    Same reasoning as ``list_invoices``: the human-approval gate is only real
+    if the approver can discover the pending requests.
+    """
+    with tools._LOCK:
+        return {
+            "ok": True,
+            "approvals": [
+                dict(appr) for _, appr in sorted(tools._APPROVALS.items())
             ],
         }
 
@@ -699,6 +789,15 @@ def verify_audit(
     return result
 
 
+@app.get("/invoices")
+def invoice_index(
+    cid: str = Depends(correlation_id_header),
+    principal: tools.Principal = Depends(require_any),
+) -> Any:
+    """List every invoice. App-layer only; the model cannot reach this."""
+    return _respond(list_invoices(), cid)
+
+
 @app.get("/invoices/{invoice_id}")
 def get_invoice(
     invoice_id: str,
@@ -754,12 +853,15 @@ def create_po(
 ) -> Any:
     """Create a PO. Operator-only; never reachable by the model."""
     correlation_id = _resolve_correlation_id(cid, req.correlation_id)
+    expected_delivery = _validate_iso_date(
+        req.expected_delivery, "expected_delivery"
+    )
     return _respond(
         tools.create_po(
             req.vendor_id,
             req.amount,
             currency=req.currency,
-            expected_delivery=req.expected_delivery,
+            expected_delivery=expected_delivery,
             requisition_id=req.requisition_id,
             correlation_id=correlation_id,
         ),
@@ -866,6 +968,15 @@ def cancel_requisition(
         ),
         correlation_id,
     )
+
+
+@app.get("/approvals")
+def approval_index(
+    cid: str = Depends(correlation_id_header),
+    principal: tools.Principal = Depends(require_any),
+) -> Any:
+    """List every payout approval. App-layer only; the model cannot reach this."""
+    return _respond(list_approvals(), cid)
 
 
 @app.get("/approvals/{approval_id}")

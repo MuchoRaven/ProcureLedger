@@ -21,13 +21,17 @@ Layout
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
+import logging
 import os
 import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
+
+_LOG = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -60,6 +64,9 @@ _RESERVED_EVENT_TYPES = frozenset(
         "THREE_WAY_MATCH",
         "TOOL_CALL_STARTED",
         "TOOL_CALL_COMPLETED",
+        # Written by ``_handle_unrecoverable_audit`` when a corrupt chain is
+        # quarantined. Reserved so the model cannot forge a reset.
+        "CHAIN_RESET",
     }
 )
 
@@ -84,11 +91,19 @@ class ToolError(Exception):
 
 @dataclass(frozen=True)
 class Principal:
-    """Authenticated caller identity."""
+    """Authenticated caller identity.
+
+    ``auth_method`` is carried into the sandbox request envelope so the audit
+    trail records how the caller authenticated. Without it,
+    ``sandbox._build_request`` fell back to ``getattr(principal,
+    "auth_method", "service")`` and every entry read ``"service"`` regardless
+    of the credential used.
+    """
 
     sub: str
     roles: Tuple[str, ...] = field(default_factory=tuple)
     email: str = ""
+    auth_method: str = "service"
 
     def has_role(self, role: str) -> bool:
         return role in self.roles
@@ -149,22 +164,90 @@ def _audit_log_path() -> str:
         return "audit_log.jsonl"
 
 
+def _audit_recovery_mode() -> str:
+    """Return the configured recovery policy: ``fail`` or ``quarantine``."""
+    try:
+        import config
+
+        return str(getattr(config, "PL_AUDIT_RECOVERY", "fail")).strip().lower()
+    except Exception:
+        return "fail"
+
+
 def _load_audit_from_file() -> List[Dict[str, Any]]:
-    """Read the durable audit log. Raises ``ToolError`` if it is unreadable."""
+    """Read the durable audit log.
+
+    A torn *trailing* line is tolerated: it means the process died mid-append,
+    so the line is incomplete rather than tampered with, and dropping it lets
+    the next append start a clean line. A bad line anywhere else - or a
+    non-object entry - raises ``AUDIT_LOG_CORRUPT``. Treating every parse
+    failure as "unreadable" is what previously pushed a single torn write into
+    the fail-open recovery path.
+    """
     path = _audit_log_path()
     if not os.path.exists(path):
         return []
-    entries: List[Dict[str, Any]] = []
     try:
         with open(path, "r", encoding="utf-8") as fh:
-            for line in fh:
-                line = line.strip()
-                if not line:
-                    continue
-                entries.append(json.loads(line))
-    except (OSError, json.JSONDecodeError) as exc:
+            raw_lines = fh.readlines()
+    except OSError as exc:
         raise ToolError("AUDIT_LOG_UNREADABLE", {"path": path, "error": str(exc)})
+
+    populated = [i for i, line in enumerate(raw_lines) if line.strip()]
+    last_populated = populated[-1] if populated else -1
+
+    entries: List[Dict[str, Any]] = []
+    for index in populated:
+        line = raw_lines[index].strip()
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError as exc:
+            if index == last_populated:
+                _LOG.warning(
+                    "audit log %s ends with a torn line at %d; dropping it",
+                    path,
+                    index + 1,
+                )
+                break
+            raise ToolError(
+                "AUDIT_LOG_CORRUPT",
+                {"path": path, "line": index + 1, "error": str(exc)},
+            )
+        if not isinstance(entry, dict):
+            raise ToolError(
+                "AUDIT_LOG_CORRUPT",
+                {
+                    "path": path,
+                    "line": index + 1,
+                    "error": "entry is not an object",
+                },
+            )
+        entries.append(entry)
     return entries
+
+
+def _verify_chain(entries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Check sequence continuity, hash linkage and per-entry hashes.
+
+    Returns a list of problems; empty means the chain is intact. Reading the
+    log without verifying it is what let a tampered file boot cleanly.
+    """
+    problems: List[Dict[str, Any]] = []
+    prev_hash = GENESIS_HASH
+    expected_seq = 1
+    for entry in entries:
+        seq = entry.get("seq")
+        if seq != expected_seq:
+            problems.append(
+                {"seq": seq, "problem": "SEQ_MISMATCH", "expected": expected_seq}
+            )
+        if entry.get("prev_hash") != prev_hash:
+            problems.append({"seq": seq, "problem": "PREV_HASH_MISMATCH"})
+        if entry.get("hash") != _compute_hash(entry):
+            problems.append({"seq": seq, "problem": "HASH_MISMATCH"})
+        prev_hash = entry.get("hash", GENESIS_HASH)
+        expected_seq += 1
+    return problems
 
 
 def _audit_entries() -> List[Dict[str, Any]]:
@@ -173,17 +256,28 @@ def _audit_entries() -> List[Dict[str, Any]]:
     Read through this helper rather than importing ``_AUDIT`` directly:
     ``_reset_state`` and ``_recover_audit_state`` rebind the module global, so
     a name imported into another module would go stale.
+
+    The copy is deep: ``payload`` is a nested dict, and a shallow copy would
+    hand the caller a reference into the live chain, letting it mutate an entry
+    without changing that entry's hash.
     """
     with _LOCK:
-        return [dict(entry) for entry in _AUDIT]
+        return copy.deepcopy(_AUDIT)
 
 
 def _persist_audit_entry(entry: Dict[str, Any]) -> None:
-    """Append one entry to the durable audit log."""
+    """Append one entry to the durable audit log and flush it to disk.
+
+    ``fsync`` is what makes the audit-before-mutation ordering meaningful: a
+    returned success must mean the entry survives a crash, not that it reached
+    a buffer.
+    """
     path = _audit_log_path()
     try:
         with open(path, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(entry, sort_keys=True, default=str) + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
     except OSError as exc:
         raise ToolError("AUDIT_LOG_UNWRITABLE", {"path": path, "error": str(exc)})
 
@@ -467,14 +561,74 @@ def _seed_state() -> None:
 # ---------------------------------------------------------------------------
 
 
+def _handle_unrecoverable_audit(exc: ToolError) -> None:
+    """Apply the configured policy to an unreadable or unverifiable chain.
+
+    ``fail`` (the default) re-raises, so the service refuses to boot. That is
+    the fail-closed choice: continuing would append ``seq=1`` with
+    ``prev_hash=GENESIS_HASH`` on top of a file that already holds entries,
+    producing duplicate sequence numbers and a broken link - a forked chain
+    that looks valid to every later reader.
+
+    ``quarantine`` moves the bad file aside, starts a fresh chain, and records
+    a ``CHAIN_RESET`` entry naming the quarantine path, so the reset is itself
+    auditable rather than silent.
+    """
+    global _AUDIT, _AUDIT_SEQ
+    if _audit_recovery_mode() != "quarantine":
+        raise exc
+
+    path = _audit_log_path()
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    quarantined = f"{path}.corrupt-{stamp}"
+    try:
+        os.replace(path, quarantined)
+    except OSError as move_exc:
+        raise ToolError(
+            "AUDIT_LOG_UNREADABLE",
+            {"path": path, "error": f"quarantine failed: {move_exc}"},
+        )
+
+    _AUDIT = []
+    _AUDIT_SEQ = 0
+    _LOG.error(
+        "audit log %s quarantined to %s after %s; starting a fresh chain",
+        path,
+        quarantined,
+        exc.code,
+    )
+    _append_audit(
+        "CHAIN_RESET",
+        {
+            "reason": exc.code,
+            "detail": exc.detail,
+            "quarantined_to": quarantined,
+        },
+        source="tool",
+    )
+
+
 def _recover_audit_state() -> None:
-    """Load the durable audit chain into memory at startup."""
+    """Load and verify the durable audit chain into memory at startup.
+
+    Verification is not optional: reading the log without checking it let a
+    tampered file boot cleanly and be appended to.
+    """
     global _AUDIT, _AUDIT_SEQ
     with _LOCK:
         try:
             entries = _load_audit_from_file()
-        except ToolError:
-            entries = []
+        except ToolError as exc:
+            _handle_unrecoverable_audit(exc)
+            return
+
+        problems = _verify_chain(entries)
+        if problems:
+            _handle_unrecoverable_audit(
+                ToolError("AUDIT_LOG_CORRUPT", {"problems": problems[:5]})
+            )
+            return
+
         _AUDIT = entries
         _AUDIT_SEQ = entries[-1]["seq"] if entries else 0
 
