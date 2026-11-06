@@ -78,6 +78,9 @@ _SNAPSHOT_ARG_KEYS = (
     "requisition_id",
     "receipt_id",
     "approval_id",
+    "rfq_id",
+    "quote_id",
+    "item_id",
     "as_of",
 )
 
