@@ -53,6 +53,18 @@ transition is rejected before an audit entry is written for it.
 ``_persist_audit`` is re-exported from ``tool_modules._state`` so the test
 suite can monkeypatch ``tools._persist_audit`` to simulate a disk failure;
 ``_state._append_audit`` resolves that attribute at call time.
+
+Phase 0 plumbing
+----------------
+``_RFQS``, ``_QUOTES`` and ``_STOCK`` are declared in this module rather than
+in ``tool_modules._state`` because the Phase 0 change is scoped to
+``tools.py``. ``_state._reset_state`` therefore does not clear them;
+``_reset_phase0_state`` does. Moving them into ``_state`` (and teaching
+``_reset_state`` about them) is the follow-up that removes that caveat.
+
+The error codes the new tools will raise are declared as constants below, so
+the apply helpers in later phases and ``app._TOOL_ERROR_STATUS`` cannot drift
+on a typo. Nothing raises them yet: Phase 0 is plumbing only.
 """
 
 from __future__ import annotations
@@ -95,6 +107,76 @@ from tool_modules._state import (
     AMOUNT_TOLERANCE,
 )
 
+# ---------------------------------------------------------------------------
+# Phase 0 state: RFQs, quotes, stock
+# ---------------------------------------------------------------------------
+#
+# These belong beside ``_POS``/``_REQUISITIONS`` in ``tool_modules._state``, but
+# this change is scoped to ``tools.py``, so they are declared here. The caveat
+# is that ``_state._reset_state`` does not clear them; a test that resets state
+# must also call ``_reset_phase0_state`` below.
+#
+# They are guarded by the same ``_LOCK`` as the rest of the store, so a
+# snapshot can never observe a half-applied mutation.
+
+_RFQS: Dict[str, Dict[str, Any]] = {}
+_QUOTES: Dict[str, Dict[str, Any]] = {}
+_STOCK: Dict[str, Dict[str, Any]] = {}
+
+
+def _reset_phase0_state() -> None:
+    """Clear the Phase 0 dicts. Companion to ``_state._reset_state``.
+
+    Exists only because the dicts live here rather than in ``_state``; once
+    they move, this function goes away and ``_reset_state`` covers them.
+    """
+    with _LOCK:
+        _RFQS.clear()
+        _QUOTES.clear()
+        _STOCK.clear()
+
+
+# ---------------------------------------------------------------------------
+# Phase 0 error codes
+# ---------------------------------------------------------------------------
+#
+# Every one is raised as ``ToolError(code, detail)``. They are constants rather
+# than bare strings so the apply helpers and ``app._TOOL_ERROR_STATUS`` cannot
+# disagree on a typo. ``PHASE0_ERROR_CODES`` is the set a test can assert is
+# fully mapped in ``app``.
+
+RFQ_NOT_FOUND = "RFQ_NOT_FOUND"
+RFQ_NOT_OPEN = "RFQ_NOT_OPEN"
+RFQ_EXISTS = "RFQ_EXISTS"
+RFQ_HAS_NO_QUOTES = "RFQ_HAS_NO_QUOTES"
+QUOTE_NOT_FOUND = "QUOTE_NOT_FOUND"
+QUOTE_EXISTS = "QUOTE_EXISTS"
+QUOTE_VENDOR_MISMATCH = "QUOTE_VENDOR_MISMATCH"
+QUOTE_CURRENCY_MISMATCH = "QUOTE_CURRENCY_MISMATCH"
+QUOTE_EXPIRED = "QUOTE_EXPIRED"
+QUOTE_NOT_SUBMITTED = "QUOTE_NOT_SUBMITTED"
+QUOTE_ALREADY_AWARDED = "QUOTE_ALREADY_AWARDED"
+STOCK_ITEM_NOT_FOUND = "STOCK_ITEM_NOT_FOUND"
+REQUISITION_ALREADY_CONVERTED = "REQUISITION_ALREADY_CONVERTED"
+
+PHASE0_ERROR_CODES = frozenset(
+    {
+        RFQ_NOT_FOUND,
+        RFQ_NOT_OPEN,
+        RFQ_EXISTS,
+        RFQ_HAS_NO_QUOTES,
+        QUOTE_NOT_FOUND,
+        QUOTE_EXISTS,
+        QUOTE_VENDOR_MISMATCH,
+        QUOTE_CURRENCY_MISMATCH,
+        QUOTE_EXPIRED,
+        QUOTE_NOT_SUBMITTED,
+        QUOTE_ALREADY_AWARDED,
+        STOCK_ITEM_NOT_FOUND,
+        REQUISITION_ALREADY_CONVERTED,
+    }
+)
+
 
 def _utc_today() -> str:
     """Return today's UTC date as an ISO-8601 string."""
@@ -110,6 +192,9 @@ def _snapshot_for(
     requisition_id: Optional[str] = None,
     receipt_id: Optional[str] = None,
     approval_id: Optional[str] = None,
+    rfq_id: Optional[str] = None,
+    quote_id: Optional[str] = None,
+    item_id: Optional[str] = None,
     as_of: Optional[str] = None,
     **_ignored: Any,
 ) -> Dict[str, Any]:
@@ -123,8 +208,11 @@ def _snapshot_for(
                             its approvals
     * ``po_id``          -> PO, its vendor, its receipts
     * ``vendor_id``      -> vendor
-    * ``requisition_id`` -> requisition, its vendor, its PO
+    * ``requisition_id`` -> requisition, its vendor, its PO, its RFQ
     * ``receipt_id``     -> receipt, its PO, that PO's vendor
+    * ``rfq_id``         -> RFQ, its quotes, their vendors, its requisition
+    * ``quote_id``       -> quote, its RFQ, its vendor
+    * ``item_id``        -> stock item, its vendor
 
     ``as_of`` is always present: ``decisions._decide_get_invoice_aging`` falls
     back to it when the caller omits the argument. An explicit, valid ISO
@@ -145,6 +233,9 @@ def _snapshot_for(
     invoices: Dict[str, Any] = {}
     approvals: Dict[str, Any] = {}
     requisitions: Dict[str, Any] = {}
+    rfqs: Dict[str, Any] = {}
+    quotes: Dict[str, Any] = {}
+    stock: Dict[str, Any] = {}
 
     with _LOCK:
 
@@ -198,6 +289,42 @@ def _snapshot_for(
             requisitions[qid] = req
             add_vendor(req.get("vendor_id"))
             add_po(req.get("po_id"))
+            # A requisition that has been sourced carries the RFQ it was
+            # raised from; pull it in so a convert decider can see the
+            # awarded quote. Safe against recursion: ``requisitions[qid]`` is
+            # set above, so the nested ``add_requisition`` from ``add_rfq``
+            # returns immediately.
+            add_rfq(req.get("rfq_id"))
+
+        def add_rfq(rid: Optional[str]) -> None:
+            if not rid or rid not in _RFQS or rid in rfqs:
+                return
+            rfq = dict(_RFQS[rid])
+            rfqs[rid] = rfq
+            add_vendor(rfq.get("vendor_id"))
+            add_requisition(rfq.get("requisition_id"))
+            # The awarded quote is the one a convert decider acts on, so it
+            # must be present even when the caller only named the RFQ.
+            add_quote(rfq.get("awarded_quote_id"))
+            # Every quote on the RFQ, so an award decider can compare them.
+            for qid, quote in _QUOTES.items():
+                if quote.get("rfq_id") == rid:
+                    add_quote(qid)
+
+        def add_quote(qid: Optional[str]) -> None:
+            if not qid or qid not in _QUOTES or qid in quotes:
+                return
+            quote = dict(_QUOTES[qid])
+            quotes[qid] = quote
+            add_vendor(quote.get("vendor_id"))
+            add_rfq(quote.get("rfq_id"))
+
+        def add_stock(iid: Optional[str]) -> None:
+            if not iid or iid not in _STOCK or iid in stock:
+                return
+            item = dict(_STOCK[iid])
+            stock[iid] = item
+            add_vendor(item.get("vendor_id"))
 
         if invoice_id:
             add_invoice(invoice_id)
@@ -211,6 +338,12 @@ def _snapshot_for(
             add_receipt(receipt_id)
         if approval_id:
             add_approval(approval_id)
+        if rfq_id:
+            add_rfq(rfq_id)
+        if quote_id:
+            add_quote(quote_id)
+        if item_id:
+            add_stock(item_id)
 
     reference = _utc_today()
     if isinstance(as_of, str) and as_of.strip():
@@ -229,6 +362,9 @@ def _snapshot_for(
         "invoices": invoices,
         "approvals": approvals,
         "requisitions": requisitions,
+        "rfqs": rfqs,
+        "quotes": quotes,
+        "stock": stock,
     }
 
 
