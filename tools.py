@@ -126,67 +126,39 @@ from tool_modules._state import (
 )
 
 # ---------------------------------------------------------------------------
-# Phase 0 error codes
+# Phase 0 error codes and Phase 1 status values
 # ---------------------------------------------------------------------------
 #
-# Every one is raised as ``ToolError(code, detail)``. They are constants rather
-# than bare strings so the apply helpers and ``app._TOOL_ERROR_STATUS`` cannot
-# disagree on a typo. ``PHASE0_ERROR_CODES`` is the set a test can assert is
-# fully mapped in ``app``.
+# The constants themselves live in ``tool_modules._codes`` so the control
+# plane, the HTTP surface and the tests share one definition. They are
+# re-exported here so ``tools.RFQ_NOT_FOUND`` and ``tools.PHASE0_ERROR_CODES``
+# keep resolving exactly as before.
 
-RFQ_NOT_FOUND = "RFQ_NOT_FOUND"
-RFQ_NOT_OPEN = "RFQ_NOT_OPEN"
-RFQ_EXISTS = "RFQ_EXISTS"
-RFQ_HAS_NO_QUOTES = "RFQ_HAS_NO_QUOTES"
-QUOTE_NOT_FOUND = "QUOTE_NOT_FOUND"
-QUOTE_EXISTS = "QUOTE_EXISTS"
-QUOTE_VENDOR_MISMATCH = "QUOTE_VENDOR_MISMATCH"
-QUOTE_CURRENCY_MISMATCH = "QUOTE_CURRENCY_MISMATCH"
-QUOTE_EXPIRED = "QUOTE_EXPIRED"
-QUOTE_NOT_SUBMITTED = "QUOTE_NOT_SUBMITTED"
-QUOTE_ALREADY_AWARDED = "QUOTE_ALREADY_AWARDED"
-STOCK_ITEM_NOT_FOUND = "STOCK_ITEM_NOT_FOUND"
-REQUISITION_ALREADY_CONVERTED = "REQUISITION_ALREADY_CONVERTED"
-
-PHASE0_ERROR_CODES = frozenset(
-    {
-        RFQ_NOT_FOUND,
-        RFQ_NOT_OPEN,
-        RFQ_EXISTS,
-        RFQ_HAS_NO_QUOTES,
-        QUOTE_NOT_FOUND,
-        QUOTE_EXISTS,
-        QUOTE_VENDOR_MISMATCH,
-        QUOTE_CURRENCY_MISMATCH,
-        QUOTE_EXPIRED,
-        QUOTE_NOT_SUBMITTED,
-        QUOTE_ALREADY_AWARDED,
-        STOCK_ITEM_NOT_FOUND,
-        REQUISITION_ALREADY_CONVERTED,
-    }
+from tool_modules._codes import (  # noqa: F401 - re-exported
+    RFQ_NOT_FOUND,
+    RFQ_NOT_OPEN,
+    RFQ_EXISTS,
+    RFQ_HAS_NO_QUOTES,
+    QUOTE_NOT_FOUND,
+    QUOTE_EXISTS,
+    QUOTE_VENDOR_MISMATCH,
+    QUOTE_CURRENCY_MISMATCH,
+    QUOTE_EXPIRED,
+    QUOTE_NOT_SUBMITTED,
+    QUOTE_ALREADY_AWARDED,
+    STOCK_ITEM_NOT_FOUND,
+    REQUISITION_ALREADY_CONVERTED,
+    PHASE0_ERROR_CODES,
+    RFQ_STATUS_OPEN,
+    RFQ_STATUS_CLOSED,
+    RFQ_STATUS_CANCELLED,
+    RFQ_STATUS_AWARDED,
+    QUOTE_STATUS_SUBMITTED,
+    QUOTE_STATUS_WITHDRAWN,
+    QUOTE_STATUS_AWARDED,
+    QUOTE_STATUS_REJECTED,
+    _LIVE_QUOTE_STATUSES,
 )
-
-
-# ---------------------------------------------------------------------------
-# Phase 1 status values
-# ---------------------------------------------------------------------------
-#
-# Constants rather than bare strings so the apply helpers, the read helpers and
-# the tests cannot drift on a typo.
-
-RFQ_STATUS_OPEN = "OPEN"
-RFQ_STATUS_CLOSED = "CLOSED"
-RFQ_STATUS_CANCELLED = "CANCELLED"
-RFQ_STATUS_AWARDED = "AWARDED"
-
-QUOTE_STATUS_SUBMITTED = "SUBMITTED"
-QUOTE_STATUS_WITHDRAWN = "WITHDRAWN"
-QUOTE_STATUS_AWARDED = "AWARDED"
-QUOTE_STATUS_REJECTED = "REJECTED"
-
-# A quote is "live" while it can still be awarded; only these statuses block a
-# second quote from the same vendor on the same RFQ.
-_LIVE_QUOTE_STATUSES = (QUOTE_STATUS_SUBMITTED, QUOTE_STATUS_AWARDED)
 
 
 def _utc_today() -> str:
