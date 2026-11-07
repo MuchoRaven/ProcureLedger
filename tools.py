@@ -2060,6 +2060,12 @@ def award_quote(
     created first on purpose: if the second commit fails, the PO is left
     behind (retryable) rather than an awarded quote with no PO.
 
+    The RFQ may be OPEN or CLOSED. Closing an RFQ stops it accepting new
+    quotes, but the quotes already on it remain awardable - which is how
+    procurement actually works - so a CLOSED RFQ is a legal award source. The
+    award stamps ``rfq_id`` onto the PO so the linkage is visible from the PO
+    side as well as the RFQ side.
+
     ``expected_delivery`` on the PO is derived from the quote's
     ``lead_time_days``; the PO amount is ``quantity * unit_price``.
     """
@@ -2075,7 +2081,7 @@ def award_quote(
             rfq = _RFQS.get(rfq_id)
             if rfq is None:
                 raise ToolError(RFQ_NOT_FOUND, {"rfq_id": rfq_id})
-            if rfq.get("status") != RFQ_STATUS_OPEN:
+            if rfq.get("status") not in (RFQ_STATUS_OPEN, RFQ_STATUS_CLOSED):
                 raise ToolError(RFQ_NOT_OPEN, {"status": rfq.get("status")})
             quote = _QUOTES.get(quote_id)
             if quote is None or quote.get("rfq_id") != rfq_id:
@@ -2132,6 +2138,10 @@ def award_quote(
             rfq["awarded_quote_id"] = quote_id
             rfq["po_id"] = po_id
             rfq["updated_at"] = stamp
+            # Stamp the linkage on the PO too, so the award is visible from
+            # the PO side. ``create_po`` does not know about RFQs, so this is
+            # the only place the back-reference is written.
+            _POS[po_id]["rfq_id"] = rfq_id
             for other_id, other in _QUOTES.items():
                 if (
                     other_id != quote_id
