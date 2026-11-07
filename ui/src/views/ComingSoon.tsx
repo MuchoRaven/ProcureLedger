@@ -1,10 +1,10 @@
 /**
  * Placeholder for a view that has not been built yet.
  *
- * It states which phase the view lands in and what it will do, so the shell
- * can be clicked through end to end before any data view exists. Phase 3
- * replaces the operator entries, Phase 4 the executor queue, Phase 5 the agent
- * console.
+ * Every nav entry routes to a real view as of Phase 5, so this is only
+ * reachable through ``App``'s default case - a stale or unknown view id. It
+ * states which phase the view would land in and what it would do, so a blank
+ * shell is never the answer.
  */
 export function ComingSoon({
   label,

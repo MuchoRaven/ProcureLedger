@@ -13,6 +13,7 @@ import { Sourcing } from './views/Sourcing';
 import { Followup } from './views/Followup';
 import { Audit } from './views/Audit';
 import { Settlement } from './views/Settlement';
+import { AgentConsole } from './views/AgentConsole';
 import type { Role } from './api/types';
 
 /**
@@ -39,9 +40,9 @@ const NAV: Record<Role, NavItem[]> = {
 };
 
 /**
- * The operator views are real as of Phase 3 and the executor queue as of
- * Phase 4. The agent console is still a placeholder, so it keeps the
- * ``ComingSoon`` shell rather than being routed to a view that does not exist.
+ * Every nav entry routes to a real view as of Phase 5. ``ComingSoon`` is kept
+ * only for the default case, which the nav cannot reach - it exists so a stale
+ * or unknown id renders an explanation rather than a blank shell.
  */
 function View({
   id,
@@ -72,13 +73,7 @@ function View({
     case 'settlement':
       return <Settlement />;
     case 'console':
-      return (
-        <ComingSoon
-          label={label}
-          phase="Phase 5"
-          note="Chat plus the tool-call transcript, including runs that end in MAX_STEPS_EXCEEDED."
-        />
-      );
+      return <AgentConsole />;
     default:
       return (
         <ComingSoon
