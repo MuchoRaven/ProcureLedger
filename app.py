@@ -135,6 +135,22 @@ import config
 import sandbox
 import tools
 
+from tool_modules._codes import (
+    RFQ_NOT_FOUND,
+    RFQ_NOT_OPEN,
+    RFQ_EXISTS,
+    RFQ_HAS_NO_QUOTES,
+    QUOTE_NOT_FOUND,
+    QUOTE_EXISTS,
+    QUOTE_VENDOR_MISMATCH,
+    QUOTE_CURRENCY_MISMATCH,
+    QUOTE_EXPIRED,
+    QUOTE_NOT_SUBMITTED,
+    QUOTE_ALREADY_AWARDED,
+    STOCK_ITEM_NOT_FOUND,
+    REQUISITION_ALREADY_CONVERTED,
+)
+
 _LOG = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -531,19 +547,19 @@ _TOOL_ERROR_STATUS = {
     # conflicts -> 409. ``RFQ_HAS_NO_QUOTES`` matches none of the suffix rules
     # but is a conflict (the RFQ exists, it just cannot be awarded yet), so it
     # is 409 rather than 404.
-    "RFQ_NOT_FOUND": 404,
-    "QUOTE_NOT_FOUND": 404,
-    "STOCK_ITEM_NOT_FOUND": 404,
-    "RFQ_NOT_OPEN": 409,
-    "RFQ_EXISTS": 409,
-    "RFQ_HAS_NO_QUOTES": 409,
-    "QUOTE_EXISTS": 409,
-    "QUOTE_VENDOR_MISMATCH": 409,
-    "QUOTE_CURRENCY_MISMATCH": 409,
-    "QUOTE_EXPIRED": 409,
-    "QUOTE_NOT_SUBMITTED": 409,
-    "QUOTE_ALREADY_AWARDED": 409,
-    "REQUISITION_ALREADY_CONVERTED": 409,
+    RFQ_NOT_FOUND: 404,
+    QUOTE_NOT_FOUND: 404,
+    STOCK_ITEM_NOT_FOUND: 404,
+    RFQ_NOT_OPEN: 409,
+    RFQ_EXISTS: 409,
+    RFQ_HAS_NO_QUOTES: 409,
+    QUOTE_EXISTS: 409,
+    QUOTE_VENDOR_MISMATCH: 409,
+    QUOTE_CURRENCY_MISMATCH: 409,
+    QUOTE_EXPIRED: 409,
+    QUOTE_NOT_SUBMITTED: 409,
+    QUOTE_ALREADY_AWARDED: 409,
+    REQUISITION_ALREADY_CONVERTED: 409,
 }
 
 # Status -> code for ``HTTPException`` raised by this module or by FastAPI.
