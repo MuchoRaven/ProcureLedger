@@ -60,14 +60,6 @@ transition is rejected before an audit entry is written for it.
 suite can monkeypatch ``tools._persist_audit`` to simulate a disk failure;
 ``_state._append_audit`` resolves that attribute at call time.
 
-Phase 0 plumbing
-----------------
-``_RFQS``, ``_QUOTES`` and ``_STOCK`` are declared in this module rather than
-in ``tool_modules._state`` because the Phase 0 change is scoped to
-``tools.py``. ``_state._reset_state`` therefore does not clear them;
-``_reset_phase0_state`` does. Moving them into ``_state`` (and teaching
-``_reset_state`` about them) is the follow-up that removes that caveat.
-
 The error codes the Phase 0 and Phase 1 tools raise are declared as constants
 below, so the apply helpers and ``app._TOOL_ERROR_STATUS`` cannot drift on a
 typo.
@@ -106,6 +98,9 @@ from tool_modules._state import (
     _INVOICES,
     _APPROVALS,
     _REQUISITIONS,
+    _RFQS,
+    _QUOTES,
+    _STOCK,
     _RESERVED_EVENT_TYPES,
     ToolError,
     Principal,
@@ -119,6 +114,7 @@ from tool_modules._state import (
     _compute_hash,
     _persist_audit_entry as _persist_audit,
     _reset_state,
+    _reset_phase0_state,
     GENESIS_HASH,
     PO_STATUS_OPEN,
     PO_STATUS_CLOSED,
@@ -128,35 +124,6 @@ from tool_modules._state import (
     REQ_STATUS_CANCELLED,
     AMOUNT_TOLERANCE,
 )
-
-# ---------------------------------------------------------------------------
-# Phase 0 state: RFQs, quotes, stock
-# ---------------------------------------------------------------------------
-#
-# These belong beside ``_POS``/``_REQUISITIONS`` in ``tool_modules._state``, but
-# this change is scoped to ``tools.py``, so they are declared here. The caveat
-# is that ``_state._reset_state`` does not clear them; a test that resets state
-# must also call ``_reset_phase0_state`` below.
-#
-# They are guarded by the same ``_LOCK`` as the rest of the store, so a
-# snapshot can never observe a half-applied mutation.
-
-_RFQS: Dict[str, Dict[str, Any]] = {}
-_QUOTES: Dict[str, Dict[str, Any]] = {}
-_STOCK: Dict[str, Dict[str, Any]] = {}
-
-
-def _reset_phase0_state() -> None:
-    """Clear the Phase 0 dicts. Companion to ``_state._reset_state``.
-
-    Exists only because the dicts live here rather than in ``_state``; once
-    they move, this function goes away and ``_reset_state`` covers them.
-    """
-    with _LOCK:
-        _RFQS.clear()
-        _QUOTES.clear()
-        _STOCK.clear()
-
 
 # ---------------------------------------------------------------------------
 # Phase 0 error codes

@@ -16,7 +16,8 @@ Layout
 * Module-level state dictionaries and the re-entrant lock that guards them.
 * Time, hashing and audit-chain helpers.
 * ``_check_transition`` / ``_transition`` / ``_commit`` primitives.
-* ``_recover_audit_state`` (called at import) and ``_reset_state`` (test hook).
+* ``_recover_audit_state`` (called at import) and ``_reset_state`` /
+  ``_reset_phase0_state`` (test hooks).
 """
 
 from __future__ import annotations
@@ -155,6 +156,7 @@ _APPROVALS: Dict[str, Dict[str, Any]] = {}
 _REQUISITIONS: Dict[str, Dict[str, Any]] = {}
 _RFQS: Dict[str, Dict[str, Any]] = {}
 _QUOTES: Dict[str, Dict[str, Any]] = {}
+_STOCK: Dict[str, Dict[str, Any]] = {}
 _EXCEPTIONS: Dict[str, Dict[str, Any]] = {}
 
 _AUDIT: List[Dict[str, Any]] = []
@@ -848,6 +850,19 @@ def _truncate_audit_log() -> None:
         pass
 
 
+def _reset_phase0_state() -> None:
+    """Clear the Phase 0 stores: RFQs, quotes and stock.
+
+    Called by ``_reset_state`` so a test reset covers them too. Kept as a
+    separate function so a caller that only wants to clear the Phase 0
+    stores can do so without touching the rest of the state.
+    """
+    with _LOCK:
+        _RFQS.clear()
+        _QUOTES.clear()
+        _STOCK.clear()
+
+
 def _reset_state() -> None:
     """Reset all in-memory state and the audit log. Test hook only."""
     global _AUDIT, _AUDIT_SEQ
@@ -858,9 +873,8 @@ def _reset_state() -> None:
         _INVOICES.clear()
         _APPROVALS.clear()
         _REQUISITIONS.clear()
-        _RFQS.clear()
-        _QUOTES.clear()
         _EXCEPTIONS.clear()
+        _reset_phase0_state()
         _AUDIT = []
         _AUDIT_SEQ = 0
         _truncate_audit_log()
