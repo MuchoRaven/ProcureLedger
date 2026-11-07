@@ -71,3 +71,29 @@ def test_run_followup_before_due_dates_flags_nothing(clean_state):
 
     assert result["flagged"] == []
     assert _events("PO_LATE") == []
+
+
+def test_empty_expected_delivery_is_never_flagged(clean_state):
+    """An unscheduled PO (``expected_delivery == ""``) is never flagged late.
+
+    ``"" < "2024-03-01"`` is True lexicographically, so without the
+    empty-string guard in ``_is_late`` this PO would be flagged on every run.
+    """
+    with tools._LOCK:
+        tools._POS["PO-1001"]["expected_delivery"] = ""
+
+    result = run_followup("2024-03-01")
+
+    assert "PO-1001" not in result["flagged"]
+    assert "PO-1002" in result["flagged"]
+
+
+def test_closed_po_is_never_flagged(clean_state):
+    """A CLOSED PO is never flagged late, even if its delivery date has passed."""
+    with tools._LOCK:
+        tools._POS["PO-1001"]["status"] = "CLOSED"
+
+    result = run_followup("2024-03-01")
+
+    assert "PO-1001" not in result["flagged"]
+    assert "PO-1002" in result["flagged"]
