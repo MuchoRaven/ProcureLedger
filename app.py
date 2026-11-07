@@ -170,6 +170,8 @@ from tool_modules._codes import (
     QUOTE_ALREADY_AWARDED,
     STOCK_ITEM_NOT_FOUND,
     REQUISITION_ALREADY_CONVERTED,
+    NO_QUOTES_FOR_SKU,
+    INVALID_WEIGHTS,
 )
 
 _LOG = logging.getLogger(__name__)
@@ -613,6 +615,13 @@ _TOOL_ERROR_STATUS = {
     REQUISITION_ALREADY_CONVERTED: 409,
     # Follow-up: a PO that is not late is a conflict, not a missing record.
     PO_NOT_LATE: 409,
+    # Vendor comparison. ``NO_QUOTES_FOR_SKU`` is a missing record - the SKU
+    # exists in the catalogue but nobody has quoted it - so 404, matching
+    # ``RFQ_NOT_FOUND``. ``INVALID_WEIGHTS`` is a caller error, so 400; it is
+    # listed explicitly rather than left to the default so the mapping is
+    # visible next to the code it maps.
+    NO_QUOTES_FOR_SKU: 404,
+    INVALID_WEIGHTS: 400,
 }
 
 # Status -> code for ``HTTPException`` raised by this module or by FastAPI.
