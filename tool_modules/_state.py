@@ -84,9 +84,14 @@ _RESERVED_EVENT_TYPES = frozenset(
         "TOOL_CALL_STARTED",
         "TOOL_CALL_COMPLETED",
         # Sourcing: RFQ -> quote -> award.
+        # RFQ_CLOSED / RFQ_CANCELLED / QUOTE_SUBMITTED are written by
+        # _tools_sourcing via _commit(..., source="tool").
         "RFQ_CREATED",
         "RFQ_STATUS_CHANGED",
+        "RFQ_CLOSED",
+        "RFQ_CANCELLED",
         "QUOTE_RECEIVED",
+        "QUOTE_SUBMITTED",
         "QUOTE_AWARDED",
         # Follow-up. Written by the maintenance pass, never by the model.
         "PO_LATE",
