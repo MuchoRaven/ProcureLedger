@@ -50,9 +50,10 @@ defined in ``decisions.py``. They are the only place non-determinism (IDs,
 timestamps) is allowed, and they re-validate under ``_LOCK`` before mutating
 so a proposal that raced past ``_redeci`` cannot corrupt state. The
 accounts-payable ones (three-way match, payout approval, audit note) live in
-``tool_modules._apply_ap`` and the procurement ones (requisitions, POs, goods
-receipts, PO/requisition status) live in ``tool_modules._apply_procurement``;
-both are re-exported below.
+``tool_modules._apply_ap``, the procurement ones (requisitions, POs, goods
+receipts, PO/requisition status) live in ``tool_modules._apply_procurement``,
+and the sourcing ones (RFQ/quote validation, RFQ status) live in
+``tool_modules._apply_sourcing``; all are re-exported below.
 
 Audit ordering
 --------------
@@ -77,7 +78,9 @@ Phase 1 (RFQs and quotes)
 ``decisions.PROPOSAL_KINDS``, so the model cannot reach them. They follow the
 same contract as the rest of the control plane - validate under ``_LOCK``,
 write the audit link before the mutation, and generate IDs/timestamps only in
-the apply step.
+the apply step. The validation helpers (``_check_create_rfq``,
+``_check_submit_quote``) and the RFQ status change (``_apply_rfq_status``) live
+in ``tool_modules._apply_sourcing``.
 
 ``award_quote`` creates its PO through the existing ``create_po`` path so the
 award lands in ``_POS`` and inherits the ``PO_CREATED`` audit entry. The PO is
@@ -222,6 +225,20 @@ from tool_modules._apply_procurement import (  # noqa: F401 - re-exported
     _apply_po_status,
     _check_requisition_status,
     _apply_requisition_status,
+)
+
+# ---------------------------------------------------------------------------
+# Sourcing apply helpers
+# ---------------------------------------------------------------------------
+#
+# ``_check_create_rfq``, ``_check_submit_quote`` and ``_apply_rfq_status`` live
+# in ``tool_modules._apply_sourcing``. They are re-exported here so the public
+# wrappers below and the tests keep reaching them through ``tools``.
+
+from tool_modules._apply_sourcing import (  # noqa: F401 - re-exported
+    _check_create_rfq,
+    _check_submit_quote,
+    _apply_rfq_status,
 )
 
 
@@ -744,27 +761,6 @@ def verify_audit_chain(from_file: bool = True) -> dict[str, Any]:
 # generate IDs/timestamps only in the apply step.
 
 
-def _check_create_rfq(vendor_ids: list[str]) -> None:
-    """Validate an RFQ-creation request without changing anything.
-
-    Every named vendor must exist, be ACTIVE and not be HIGH risk. Run under
-    ``_LOCK`` so a vendor that went inactive after the request was formed is
-    rejected before an audit link is written for it.
-    """
-    with _LOCK:
-        for vid in vendor_ids:
-            vendor = _VENDORS.get(vid)
-            if vendor is None:
-                raise ToolError("VENDOR_NOT_FOUND", {"vendor_id": vid})
-            if vendor.get("status") != "ACTIVE":
-                raise ToolError(
-                    "VENDOR_INACTIVE",
-                    {"vendor_id": vid, "status": vendor.get("status")},
-                )
-            if vendor.get("risk_tier") == "HIGH":
-                raise ToolError("VENDOR_HIGH_RISK", {"vendor_id": vid})
-
-
 def create_rfq(
     description: str,
     quantity: Any,
@@ -873,48 +869,6 @@ def create_rfq(
         return {"ok": False, "error": exc.code, "detail": exc.detail}
 
     return {"ok": True, "rfq": dict(record)}
-
-
-def _check_submit_quote(
-    rfq_id: str, vendor_id: str, currency: str, valid_until: str
-) -> None:
-    """Validate a quote submission without changing anything.
-
-    The guards are the ones that can race: the RFQ must still be OPEN, the
-    vendor must still be on the RFQ, the currency must still match, the quote
-    must not already be expired, and the vendor must not already have a live
-    quote on this RFQ.
-    """
-    with _LOCK:
-        rfq = _RFQS.get(rfq_id)
-        if rfq is None:
-            raise ToolError(RFQ_NOT_FOUND, {"rfq_id": rfq_id})
-        if rfq.get("status") != RFQ_STATUS_OPEN:
-            raise ToolError(RFQ_NOT_OPEN, {"status": rfq.get("status")})
-        if vendor_id not in (rfq.get("vendor_ids") or []):
-            raise ToolError(
-                QUOTE_VENDOR_MISMATCH,
-                {"rfq_id": rfq_id, "vendor_id": vendor_id},
-            )
-        if currency != rfq.get("currency"):
-            raise ToolError(
-                QUOTE_CURRENCY_MISMATCH,
-                {"currency": currency, "rfq_currency": rfq.get("currency")},
-            )
-        today = _utc_today()
-        if valid_until and valid_until < today:
-            raise ToolError(
-                QUOTE_EXPIRED, {"valid_until": valid_until, "as_of": today}
-            )
-        for quote in _QUOTES.values():
-            if (
-                quote.get("rfq_id") == rfq_id
-                and quote.get("vendor_id") == vendor_id
-                and quote.get("status") in _LIVE_QUOTE_STATUSES
-            ):
-                raise ToolError(
-                    QUOTE_EXISTS, {"quote_id": quote.get("quote_id")}
-                )
 
 
 def submit_quote(
@@ -1035,46 +989,6 @@ def submit_quote(
         return {"ok": False, "error": exc.code, "detail": exc.detail}
 
     return {"ok": True, "quote": dict(record)}
-
-
-def _apply_rfq_status(
-    rfq_id: str, to_status: str, event_type: str, correlation_id: str
-) -> dict[str, Any]:
-    """Close or cancel an OPEN RFQ.
-
-    Only ``CLOSED`` and ``CANCELLED`` are accepted. The check re-reads the RFQ
-    under ``_LOCK`` so a request that raced with an award cannot close an RFQ
-    that has already moved on.
-    """
-    if not isinstance(rfq_id, str) or not rfq_id.strip():
-        return {"ok": False, "error": "MALFORMED_PROPOSAL", "detail": "rfq_id"}
-    rfq_id = rfq_id.strip()
-    if to_status not in (RFQ_STATUS_CLOSED, RFQ_STATUS_CANCELLED):
-        return {"ok": False, "error": "MALFORMED_PROPOSAL", "detail": "to_status"}
-
-    def check() -> None:
-        with _LOCK:
-            rfq = _RFQS.get(rfq_id)
-            if rfq is None:
-                raise ToolError(RFQ_NOT_FOUND, {"rfq_id": rfq_id})
-            if rfq.get("status") != RFQ_STATUS_OPEN:
-                raise ToolError(RFQ_NOT_OPEN, {"status": rfq.get("status")})
-
-    def mutation() -> None:
-        with _LOCK:
-            rfq = _RFQS[rfq_id]
-            rfq["status"] = to_status
-            rfq["updated_at"] = _now()
-
-    payload = {"rfq_id": rfq_id, "from": RFQ_STATUS_OPEN, "to": to_status}
-
-    try:
-        _commit(mutation, event_type, payload, correlation_id, check=check)
-    except ToolError as exc:
-        return {"ok": False, "error": exc.code, "detail": exc.detail}
-
-    with _LOCK:
-        return {"ok": True, "rfq": dict(_RFQS[rfq_id])}
 
 
 def close_rfq(rfq_id: str, correlation_id: str = "") -> dict[str, Any]:
