@@ -160,10 +160,15 @@ from tool_modules._codes import (  # noqa: F401 - re-exported
     _LIVE_QUOTE_STATUSES,
 )
 
+# ---------------------------------------------------------------------------
+# Shared helpers
+# ---------------------------------------------------------------------------
+#
+# ``_utc_today`` and ``_as_float`` live in ``tool_modules._util``. They are
+# imported here so ``tools._utc_today`` / ``tools._as_float`` keep resolving
+# for callers that reach them through this module.
 
-def _utc_today() -> str:
-    """Return today's UTC date as an ISO-8601 string."""
-    return _now()[:10]
+from tool_modules._util import _as_float, _utc_today
 
 
 def _snapshot_for(
@@ -354,13 +359,6 @@ def _snapshot_for(
 # ---------------------------------------------------------------------------
 # Apply helpers (control-plane side of the proposal contract)
 # ---------------------------------------------------------------------------
-
-
-def _as_float(value: Any) -> float:
-    """Coerce a numeric field to float, treating anything else as 0.0."""
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
-        return float(value)
-    return 0.0
 
 
 def _receipts_for_invoice(invoice: dict[str, Any]) -> list[dict[str, Any]]:
