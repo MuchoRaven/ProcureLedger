@@ -8,6 +8,16 @@ once those callers import from ``tool_modules`` directly.
 
 The Phase 0 caveat lives in ``tool_modules._codes``; the ``_persist_audit``
 re-export note lives in ``tool_modules._state``.
+
+The two SKU-scoped vendor-quote reads (``get_vendor_quotes`` and
+``compare_vendors``) are re-exported here for the same reason as every other
+tool: ``agent._DISPATCH`` is built at import as
+``{name: getattr(tools, name) for name in ALLOWED_TOOLS}``, and
+``ALLOWED_TOOLS`` is derived from ``decisions.PROPOSAL_KINDS``. Registering
+either tool there without a matching re-export here would raise
+``AttributeError`` at import and take the whole app down, not just the new
+tool. Both are reads, so ``sandbox._apply`` returns their proposal's ``data``
+directly and never calls back into this module.
 """
 
 from __future__ import annotations
@@ -96,6 +106,11 @@ from tool_modules._tools_sourcing import (
     award_quote,
 )
 
+from tool_modules._tools_vendor_compare import (
+    get_vendor_quotes,
+    compare_vendors,
+)
+
 __all__ = [
     # Public tools
     "lookup_vendor", "get_invoice", "get_invoice_aging", "run_three_way_match",
@@ -105,6 +120,7 @@ __all__ = [
     "close_po", "cancel_po",
     "create_rfq", "submit_quote", "close_rfq", "cancel_rfq", "get_rfq",
     "get_quote", "list_quotes", "award_quote",
+    "get_vendor_quotes", "compare_vendors",
     "log_audit_event", "verify_audit_chain",
     # Snapshot
     "_snapshot_for",
