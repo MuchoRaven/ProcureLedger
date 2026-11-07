@@ -267,21 +267,19 @@ def test_record_receipt_emits_goods_receipt(clean_state):
 
     The seed POs are both fully received, so this raises a fresh PO first.
     """
-    assert (
-        _call(
-            tools.create_po,
-            "PO-9003",
-            "VEND-001",
-            500.00,
-            "USD",
-            "2024-03-01",
-            None,
-            "cid-po",
-        )["ok"]
-        is True
+    created = _call(
+        tools.create_po,
+        "VEND-001",
+        500.00,
+        "USD",
+        "2024-03-01",
+        None,
+        "cid-po",
     )
+    assert created["ok"] is True
+    po_id = created["po"]["po_id"]
 
-    result = _call(tools.record_receipt, "RCPT-9001", "PO-9003", 500.00, "cid-rcpt")
+    result = _call(tools.record_goods_receipt, "RCPT-9001", po_id, 500.00, "cid-rcpt")
     assert result["ok"] is True
     assert "RCPT-9001" in tools._RECEIPTS
 
@@ -295,7 +293,9 @@ def test_record_receipt_rejects_over_receipt(clean_state):
 
     ``PO-1002`` is already fully covered by ``RCPT-3002``.
     """
-    result = _call(tools.record_receipt, "RCPT-9002", "PO-1002", 100.00, "cid-over")
+    result = _call(
+        tools.record_goods_receipt, "RCPT-9002", "PO-1002", 100.00, "cid-over"
+    )
     assert result["ok"] is False
     assert result["error"] == "RECEIPT_EXCEEDS_PO"
     assert "RCPT-9002" not in tools._RECEIPTS
