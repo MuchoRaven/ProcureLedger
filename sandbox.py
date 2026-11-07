@@ -71,6 +71,9 @@ _REQUIRED_BINARIES = ("bwrap", "prlimit")
 # forwarded to ``tools._snapshot_for``; everything else in ``arguments``
 # (amounts, notes, ...) is business data, not a selector. ``as_of`` is not an
 # ID but is forwarded so the snapshot is a pure function of the arguments.
+# ``sku`` is a selector too, and the one that widens rather than narrows: a
+# vendor comparison needs every quote for the SKU, not one. It is still
+# bounded by the SKU, so the snapshot never becomes the whole store.
 _SNAPSHOT_ARG_KEYS = (
     "invoice_id",
     "vendor_id",
@@ -81,6 +84,7 @@ _SNAPSHOT_ARG_KEYS = (
     "rfq_id",
     "quote_id",
     "item_id",
+    "sku",
     "as_of",
 )
 
