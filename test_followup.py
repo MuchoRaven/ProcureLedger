@@ -128,3 +128,28 @@ def test_notify_delay_writes_event_and_is_idempotent(clean_state):
     assert result2["ok"] is True
     assert result2["skipped"] is True
     assert len(_events("DELAY_NOTIFIED")) == 1
+
+
+def test_list_late_pos_reports_days_late_and_includes_notified(clean_state):
+    """The worklist reports ``days_late`` and keeps already-notified POs.
+
+    ``list_late_pos`` answers "what is late", not "what is newly late", so a
+    PO that has been flagged and notified is still listed. ``days_late`` is
+    computed against the pinned ``as_of``, not today.
+    """
+    _apply_flag_late("PO-1001", "2024-03-01", "cid")
+    _apply_notify_delay("PO-1001", "alice", "cid")
+
+    result = list_late_pos("2024-03-01")
+
+    assert result["ok"] is True
+
+    by_id = {po["po_id"]: po for po in result["pos"]}
+
+    # 2024-03-01 - 2024-01-20 = 41 days (2024 is a leap year).
+    assert by_id["PO-1001"]["days_late"] == 41
+    # 2024-03-01 - 2024-02-10 = 20 days.
+    assert by_id["PO-1002"]["days_late"] == 20
+
+    # Already-notified POs are still included.
+    assert "PO-1001" in by_id
