@@ -1,4 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { ApiError, call, type RequestOptions } from './client';
+import { useSession } from '../auth/session';
 
 type ResourceState<T> = {
   data: T | null;
@@ -124,4 +126,37 @@ export function useAction() {
   }, []);
 
   return { ...state, run, reset };
+}
+
+/**
+ * Bind the session token to ``call`` so views never thread it by hand.
+ *
+ * A 401 means the stored token is no longer accepted - expired, rotated, or
+ * the deployment changed its credentials. Rather than let every view render a
+ * 401 banner forever, the session is dropped and the login screen returns.
+ * The error is still re-thrown so the caller's own handling runs first.
+ *
+ * Only 401 triggers this. A 403 is a role problem, not a credential problem:
+ * signing out would be the wrong response to "this endpoint needs the operator
+ * credential", and the nav is built so a role never reaches one.
+ */
+export function useApi() {
+  const { session, signOut } = useSession();
+  const token = session?.token ?? '';
+
+  const request = useCallback(
+    async <T,>(path: string, init?: RequestOptions): Promise<T> => {
+      try {
+        return await call<T>(path, token, init);
+      } catch (err) {
+        if (err instanceof ApiError && err.status === 401) {
+          signOut();
+        }
+        throw err;
+      }
+    },
+    [token, signOut],
+  );
+
+  return { token, request };
 }
