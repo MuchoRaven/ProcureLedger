@@ -58,6 +58,11 @@ SANDBOX_LIMITS = {
 PL_RATE_LIMIT_PER_MIN = int(os.environ.get("PL_RATE_LIMIT_PER_MIN", "120"))
 PL_RATE_LIMIT_BURST = int(os.environ.get("PL_RATE_LIMIT_BURST", "20"))
 
+# Follow-up scheduler interval, in seconds. ``0`` disables the scheduler.
+# Parsed at import so a malformed value fails fast at boot, matching
+# ``SANDBOX_LIMITS`` and ``PL_RATE_LIMIT_*`` above.
+PL_FOLLOWUP_INTERVAL_S = int(os.environ.get("PL_FOLLOWUP_INTERVAL_S", "0"))
+
 # ---------------------------------------------------------------------------
 # Authentication
 # ---------------------------------------------------------------------------
