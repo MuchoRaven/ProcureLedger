@@ -39,3 +39,35 @@ def clean_state(tmp_path, monkeypatch):
 
 def _events(event_type):
     return [e for e in tools._load_audit_from_file() if e["event_type"] == event_type]
+
+
+def test_run_followup_flags_both_seed_pos(clean_state):
+    """Both seed POs are past 2024-03-01, so both are flagged in one pass."""
+    result = run_followup("2024-03-01")
+
+    assert result["ok"] is True
+    assert sorted(result["flagged"]) == ["PO-1001", "PO-1002"]
+
+    events = _events("PO_LATE")
+    assert len(events) == 2
+    assert all(entry["source"] == "tool" for entry in events)
+
+
+def test_run_followup_is_idempotent(clean_state):
+    """A second pass flags nothing and does not duplicate the audit entries."""
+    run_followup("2024-03-01")
+    result = run_followup("2024-03-01")
+
+    assert result["flagged"] == []
+    # ``result["skipped"]`` is also ``[]`` on the second run, because
+    # ``_late_pos`` filters already-flagged POs out before ``_apply_flag_late``
+    # is called. Do not assert ``skipped == ["PO-1001", "PO-1002"]``.
+    assert len(_events("PO_LATE")) == 2
+
+
+def test_run_followup_before_due_dates_flags_nothing(clean_state):
+    """Neither seed PO is late as of 2024-01-01, so nothing is flagged."""
+    result = run_followup("2024-01-01")
+
+    assert result["flagged"] == []
+    assert _events("PO_LATE") == []
