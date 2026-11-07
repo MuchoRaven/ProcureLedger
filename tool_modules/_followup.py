@@ -87,3 +87,141 @@ def _late_pos(as_of: str = "") -> list[str]:
             and _is_late(po, reference)
             and not po.get("late_flagged_at")
         )
+
+
+def _check_flag_late(po_id: str, as_of: str) -> None:
+    """Validate a late-flag request without changing anything.
+
+    Runs inside ``_commit``'s ``check`` callable, so it raises rather than
+    returns. The order matters: a missing PO is ``PO_NOT_FOUND``, a PO that is
+    not OPEN is ``PO_NOT_OPEN``, a PO that is not late is ``PO_NOT_LATE``, and
+    only then is an already-flagged PO reported as ``_PO_ALREADY_FLAGGED`` -
+    which ``_apply_flag_late`` turns into a skip.
+    """
+    with _LOCK:
+        po = _POS.get(po_id)
+        if po is None:
+            raise ToolError("PO_NOT_FOUND", {"po_id": po_id})
+        if po.get("status") != PO_STATUS_OPEN:
+            raise ToolError(
+                "PO_NOT_OPEN",
+                {"po_id": po_id, "status": po.get("status")},
+            )
+        if not _is_late(po, as_of):
+            raise ToolError(
+                PO_NOT_LATE,
+                {
+                    "po_id": po_id,
+                    "expected_delivery": po.get("expected_delivery"),
+                    "as_of": as_of,
+                },
+            )
+        if po.get("late_flagged_at"):
+            raise ToolError(
+                _PO_ALREADY_FLAGGED,
+                {"po_id": po_id, "late_flagged_at": po.get("late_flagged_at")},
+            )
+
+
+def _apply_flag_late(po_id: str, as_of: str, correlation_id: str = "") -> dict:
+    """Flag one late PO, idempotently.
+
+    Resolves ``as_of`` at the top so a direct call with ``""`` means today.
+    Reads ``expected_delivery`` under ``_LOCK`` to compute ``days_late`` for
+    the audit payload; a missing or malformed value yields ``0``, which is
+    never persisted because ``_check_flag_late`` raises ``PO_NOT_LATE`` first.
+
+    A missing PO is reported without calling ``_commit``: the check would
+    raise the same code, so this is equivalent and avoids a ``KeyError`` on
+    the read above. An already-flagged PO is a skip, not an error, which is
+    what makes the pass idempotent and race-safe.
+    """
+    reference = _resolve_as_of(as_of)
+
+    with _LOCK:
+        po = _POS.get(po_id)
+        if po is None:
+            return {
+                "ok": False,
+                "error": "PO_NOT_FOUND",
+                "detail": {"po_id": po_id},
+            }
+        expected_delivery = po.get("expected_delivery")
+
+    days_late = 0
+    if isinstance(expected_delivery, str) and expected_delivery:
+        try:
+            days_late = (
+                date.fromisoformat(reference)
+                - date.fromisoformat(expected_delivery)
+            ).days
+        except ValueError:
+            days_late = 0
+
+    def mutation() -> None:
+        with _LOCK:
+            _POS[po_id]["late_flagged_at"] = _now()
+
+    payload = {
+        "po_id": po_id,
+        "expected_delivery": expected_delivery,
+        "as_of": reference,
+        "days_late": days_late,
+    }
+
+    try:
+        _commit(
+            mutation,
+            "PO_LATE",
+            payload,
+            correlation_id,
+            check=lambda: _check_flag_late(po_id, reference),
+        )
+    except ToolError as exc:
+        if exc.code == _PO_ALREADY_FLAGGED:
+            return {"ok": True, "skipped": True, "po_id": po_id}
+        return {"ok": False, "error": exc.code, "detail": exc.detail}
+
+    return {"ok": True, "po_id": po_id, "days_late": days_late}
+
+
+def run_followup(as_of: str = "") -> dict:
+    """Flag every late, unflagged OPEN PO as of ``as_of``.
+
+    Resolves ``as_of`` once, collects the IDs outside any lock, then flags
+    them one at a time. ``_LOCK`` is deliberately not held across the loop:
+    ``_commit`` does an fsync per entry, and holding the lock would serialise
+    the whole store behind the audit log.
+
+    Each result is classified as ``skipped`` (already flagged), ``flagged``
+    (newly flagged), or an error. The pass is idempotent, so re-running it
+    reports the same POs as skipped rather than flagging them twice.
+    """
+    reference = _resolve_as_of(as_of)
+
+    flagged: list[str] = []
+    skipped: list[str] = []
+    errors: list[dict] = []
+
+    for po_id in _late_pos(reference):
+        result = _apply_flag_late(po_id, reference)
+        if result.get("ok") and result.get("skipped"):
+            skipped.append(po_id)
+        elif result.get("ok"):
+            flagged.append(po_id)
+        else:
+            errors.append(
+                {
+                    "po_id": po_id,
+                    "error": result.get("error"),
+                    "detail": result.get("detail"),
+                }
+            )
+
+    return {
+        "ok": True,
+        "as_of": reference,
+        "flagged": flagged,
+        "skipped": skipped,
+        "errors": errors,
+    }
