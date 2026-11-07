@@ -61,8 +61,8 @@ suite can monkeypatch ``tools._persist_audit`` to simulate a disk failure;
 ``_state._append_audit`` resolves that attribute at call time.
 
 The error codes the Phase 0 and Phase 1 tools raise are declared as constants
-below, so the apply helpers and ``app._TOOL_ERROR_STATUS`` cannot drift on a
-typo.
+in ``tool_modules._codes`` and re-exported below, so the apply helpers and
+``app._TOOL_ERROR_STATUS`` cannot drift on a typo.
 
 Phase 1 (RFQs and quotes)
 -------------------------
