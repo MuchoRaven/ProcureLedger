@@ -7,10 +7,9 @@ approval, and the agent's audit note.
 These helpers used to live in ``tools.py``. They are moved here so the AP apply
 path can be read without the whole tool layer. The bodies are unchanged.
 
-``_apply_audit_note`` delegates to ``log_audit_event``, which still lives in
-``tools``. A module-scope import would be a cycle (``tools`` imports this
-module), so it is imported inside the function, at call time, when ``tools`` is
-fully loaded.
+``_apply_audit_note`` delegates to ``log_audit_event``, which lives in
+``tool_modules._tools_audit``. That module imports only ``_state``, so the
+import is at module scope: there is no cycle back to ``tools``.
 """
 
 from __future__ import annotations
@@ -32,6 +31,7 @@ from tool_modules._state import (
     _check_transition,
     AMOUNT_TOLERANCE,
 )
+from tool_modules._tools_audit import log_audit_event
 from tool_modules._util import _as_float
 
 
@@ -307,15 +307,8 @@ def _apply_audit_note(
     if not isinstance(payload, dict):
         return {"ok": False, "error": "MALFORMED_PROPOSAL", "detail": "payload"}
 
-    # Imported here, not at module scope: ``tools`` imports this module, so a
-    # top-level import would be a cycle. By call time ``tools`` is fully
-    # loaded and the attribute resolves. When ``log_audit_event`` moves to
-    # ``tool_modules._tools_audit``, this becomes
-    # ``from tool_modules._tools_audit import log_audit_event``.
-    import tools
-
     try:
-        return tools.log_audit_event(
+        return log_audit_event(
             event_type, payload, correlation_id, source="agent"
         )
     except ToolError as exc:

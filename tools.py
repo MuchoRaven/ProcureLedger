@@ -55,6 +55,10 @@ receipts, PO/requisition status) live in ``tool_modules._apply_procurement``,
 and the sourcing ones (RFQ/quote validation, RFQ status) live in
 ``tool_modules._apply_sourcing``; all are re-exported below.
 
+The audit-chain tools (``log_audit_event``, ``verify_audit_chain``) live in
+``tool_modules._tools_audit`` and are re-exported below, so ``agent``, ``app``
+and the tests keep reaching them through ``tools``.
+
 Audit ordering
 --------------
 ``_commit`` writes the audit link *before* running the mutation, so a failed
@@ -64,7 +68,10 @@ transition is rejected before an audit entry is written for it.
 
 ``_persist_audit`` is re-exported from ``tool_modules._state`` so the test
 suite can monkeypatch ``tools._persist_audit`` to simulate a disk failure;
-``_state._append_audit`` resolves that attribute at call time.
+``_state._append_audit`` resolves that attribute at call time. The same
+re-export is what keeps ``tools._load_audit_from_file`` and
+``tools._audit_entries`` available to the tests now that the functions that
+used them have moved out.
 
 The error codes the Phase 0 and Phase 1 tools raise are declared as constants
 in ``tool_modules._codes`` and re-exported below, so the apply helpers and
@@ -239,6 +246,19 @@ from tool_modules._apply_sourcing import (  # noqa: F401 - re-exported
     _check_create_rfq,
     _check_submit_quote,
     _apply_rfq_status,
+)
+
+# ---------------------------------------------------------------------------
+# Audit-chain tools
+# ---------------------------------------------------------------------------
+#
+# ``log_audit_event`` and ``verify_audit_chain`` live in
+# ``tool_modules._tools_audit``. They are re-exported here so ``agent``,
+# ``app`` and the tests keep reaching them through ``tools``.
+
+from tool_modules._tools_audit import (  # noqa: F401 - re-exported
+    log_audit_event,
+    verify_audit_chain,
 )
 
 
@@ -474,51 +494,6 @@ def cancel_po(po_id: str, correlation_id: str = "") -> dict[str, Any]:
     )
 
 
-def log_audit_event(
-    event_type: str,
-    payload: dict[str, Any],
-    correlation_id: str = "",
-    source: str = "agent",
-) -> dict[str, Any]:
-    """Append a note to the audit chain.
-
-    ``source="tool"`` is the control plane's own bookkeeping and may use the
-    reserved event types; ``source="agent"`` (the default) may not. Raises
-    ``ToolError`` when the chain itself is unwritable - the caller decides
-    whether that is fatal (``agent._audit`` treats it as such).
-    """
-    if not isinstance(event_type, str) or not event_type.strip():
-        return {
-            "ok": False,
-            "error": "INVALID_EVENT_TYPE",
-            "detail": "event_type must be a non-empty string",
-        }
-    if not isinstance(payload, dict):
-        return {
-            "ok": False,
-            "error": "INVALID_PAYLOAD",
-            "detail": "payload must be an object",
-        }
-
-    event_type = event_type.strip()
-    if source != "tool" and event_type in _RESERVED_EVENT_TYPES:
-        return {
-            "ok": False,
-            "error": "RESERVED_EVENT_TYPE",
-            "detail": event_type,
-        }
-
-    entry = _append_audit(event_type, payload, correlation_id, source=source)
-    return {
-        "ok": True,
-        "audit": {
-            "seq": entry.get("seq"),
-            "event_type": entry.get("event_type"),
-            "hash": entry.get("hash"),
-        },
-    }
-
-
 def ingest_invoice(
     invoice_id: str,
     vendor_id: str,
@@ -701,54 +676,6 @@ def _execute_payout(
 
     with _LOCK:
         return {"ok": True, "approval": dict(_APPROVALS[approval_id])}
-
-
-def verify_audit_chain(from_file: bool = True) -> dict[str, Any]:
-    """Re-verify the hash chain.
-
-    Reports an unreadable log in-band with ``ok: True`` and the raw error text
-    in ``detail``; ``app.py`` redacts that field on 5xx-style failures. A
-    broken link is reported with ``valid: False`` and the index it broke at.
-    """
-    try:
-        entries = _load_audit_from_file() if from_file else _audit_entries()
-    except ToolError as exc:
-        return {
-            "ok": True,
-            "valid": False,
-            "entries": 0,
-            "detail": exc.detail,
-        }
-
-    prev = GENESIS_HASH
-    for index, entry in enumerate(entries):
-        if not isinstance(entry, dict):
-            return {
-                "ok": True,
-                "valid": False,
-                "entries": len(entries),
-                "broken_at": index,
-                "reason": "MALFORMED_ENTRY",
-            }
-        if entry.get("prev_hash") != prev:
-            return {
-                "ok": True,
-                "valid": False,
-                "entries": len(entries),
-                "broken_at": index,
-                "reason": "PREV_HASH_MISMATCH",
-            }
-        if entry.get("hash") != _compute_hash(entry):
-            return {
-                "ok": True,
-                "valid": False,
-                "entries": len(entries),
-                "broken_at": index,
-                "reason": "HASH_MISMATCH",
-            }
-        prev = entry.get("hash", prev)
-
-    return {"ok": True, "valid": True, "entries": len(entries)}
 
 
 # ---------------------------------------------------------------------------
