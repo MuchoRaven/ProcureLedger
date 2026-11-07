@@ -135,6 +135,13 @@ import config
 import sandbox
 import tools
 
+from tool_modules import (
+    _tools_ap,
+    _tools_audit,
+    _tools_procurement,
+    _tools_sourcing,
+)
+
 from tool_modules._codes import (
     RFQ_NOT_FOUND,
     RFQ_NOT_OPEN,
@@ -1122,7 +1129,7 @@ def verify_audit(
     and the raw ``OSError`` text in ``detail``, so the redaction that
     ``_redact`` applies to error responses has to be applied here too.
     """
-    result = dict(tools.verify_audit_chain(from_file=from_file))
+    result = dict(_tools_audit.verify_audit_chain(from_file=from_file))
     result["correlation_id"] = cid
     if not config.PL_DEBUG and result.get("detail"):
         result.pop("detail", None)
@@ -1144,7 +1151,7 @@ def get_invoice(
     cid: str = Depends(correlation_id_header),
     principal: tools.Principal = Depends(require_any),
 ) -> Any:
-    return _respond(tools.get_invoice(invoice_id), cid)
+    return _respond(_tools_ap.get_invoice(invoice_id), cid)
 
 
 @app.post("/invoices")
@@ -1155,7 +1162,7 @@ def ingest_invoice(
 ) -> Any:
     correlation_id = _resolve_correlation_id(cid, req.correlation_id)
     return _respond(
-        tools.ingest_invoice(
+        _tools_ap.ingest_invoice(
             req.invoice_id,
             req.vendor_id,
             req.po_id,
@@ -1182,7 +1189,7 @@ def get_po(
     cid: str = Depends(correlation_id_header),
     principal: tools.Principal = Depends(require_any),
 ) -> Any:
-    return _respond(tools.get_po(po_id), cid)
+    return _respond(_tools_procurement.get_po(po_id), cid)
 
 
 @app.post("/pos")
@@ -1197,7 +1204,7 @@ def create_po(
         req.expected_delivery, "expected_delivery"
     )
     return _respond(
-        tools.create_po(
+        _tools_procurement.create_po(
             req.vendor_id,
             req.amount,
             currency=req.currency,
@@ -1219,7 +1226,7 @@ def record_goods_receipt(
     """Record a goods receipt against an OPEN PO. Operator-only."""
     correlation_id = _resolve_correlation_id(cid, req.correlation_id)
     return _respond(
-        tools.record_goods_receipt(
+        _tools_procurement.record_goods_receipt(
             po_id, req.amount, correlation_id=correlation_id
         ),
         correlation_id,
@@ -1236,7 +1243,8 @@ def close_po(
     """Close an OPEN PO. Operator-only."""
     correlation_id = _resolve_correlation_id(cid, req.correlation_id)
     return _respond(
-        tools.close_po(po_id, correlation_id=correlation_id), correlation_id
+        _tools_procurement.close_po(po_id, correlation_id=correlation_id),
+        correlation_id,
     )
 
 
@@ -1250,7 +1258,8 @@ def cancel_po(
     """Cancel an OPEN PO. Operator-only."""
     correlation_id = _resolve_correlation_id(cid, req.correlation_id)
     return _respond(
-        tools.cancel_po(po_id, correlation_id=correlation_id), correlation_id
+        _tools_procurement.cancel_po(po_id, correlation_id=correlation_id),
+        correlation_id,
     )
 
 
@@ -1271,8 +1280,11 @@ def create_requisition(
 ) -> Any:
     """Raise a purchase requisition. Operator-only; never reachable by the model."""
     correlation_id = _resolve_correlation_id(cid, req.correlation_id)
+    # Known gap: ``_tools_procurement`` has no public ``create_requisition``
+    # wrapper yet - only the private ``_apply_create_requisition``. This
+    # endpoint raises AttributeError at request time until the wrapper lands.
     return _respond(
-        tools.create_requisition(
+        _tools_procurement.create_requisition(
             req.description,
             req.quantity,
             req.amount,
@@ -1290,7 +1302,7 @@ def get_requisition(
     cid: str = Depends(correlation_id_header),
     principal: tools.Principal = Depends(require_any),
 ) -> Any:
-    return _respond(tools.get_requisition(requisition_id), cid)
+    return _respond(_tools_procurement.get_requisition(requisition_id), cid)
 
 
 @app.post("/requisitions/{requisition_id}/cancel")
@@ -1302,8 +1314,9 @@ def cancel_requisition(
 ) -> Any:
     """Cancel an OPEN requisition. Operator-only."""
     correlation_id = _resolve_correlation_id(cid, req.correlation_id)
+    # Known gap: same as ``create_requisition`` - no public wrapper exists yet.
     return _respond(
-        tools.cancel_requisition(
+        _tools_procurement.cancel_requisition(
             requisition_id, correlation_id=correlation_id
         ),
         correlation_id,
@@ -1325,7 +1338,7 @@ def get_approval(
     cid: str = Depends(correlation_id_header),
     principal: tools.Principal = Depends(require_any),
 ) -> Any:
-    return _respond(tools.get_approval(approval_id), cid)
+    return _respond(_tools_ap.get_approval(approval_id), cid)
 
 
 @app.post("/approvals/{approval_id}/approve")
@@ -1352,7 +1365,9 @@ def approve(
         )
 
     return _respond(
-        tools.approve_payout(approval_id, identity, correlation_id=correlation_id),
+        _tools_ap.approve_payout(
+            approval_id, identity, correlation_id=correlation_id
+        ),
         correlation_id,
     )
 
@@ -1371,7 +1386,7 @@ def execute(
     """
     correlation_id = _resolve_correlation_id(cid, req.correlation_id)
     return _respond(
-        tools._execute_payout(
+        _tools_ap._execute_payout(
             approval_id, principal.sub, correlation_id=correlation_id
         ),
         correlation_id,
@@ -1397,7 +1412,7 @@ def create_rfq(
     """Open a request for quotes. Operator-only; never reachable by the model."""
     correlation_id = _resolve_correlation_id(cid, req.correlation_id)
     return _respond(
-        tools.create_rfq(
+        _tools_sourcing.create_rfq(
             req.description,
             req.quantity,
             req.currency,
@@ -1424,7 +1439,7 @@ def get_rfq(
     cid: str = Depends(correlation_id_header),
     principal: tools.Principal = Depends(require_operator),
 ) -> Any:
-    return _respond(tools.get_rfq(rfq_id), cid)
+    return _respond(_tools_sourcing.get_rfq(rfq_id), cid)
 
 
 @app.post("/rfqs/{rfq_id}/quotes")
@@ -1437,7 +1452,7 @@ def submit_quote(
     """Submit a vendor quote against an OPEN RFQ. Operator-only."""
     correlation_id = _resolve_correlation_id(cid, req.correlation_id)
     return _respond(
-        tools.submit_quote(
+        _tools_sourcing.submit_quote(
             rfq_id,
             req.vendor_id,
             req.unit_price,
@@ -1457,7 +1472,7 @@ def rfq_quotes(
     principal: tools.Principal = Depends(require_operator),
 ) -> Any:
     """List every quote on an RFQ. App-layer only."""
-    return _respond(tools.list_quotes(rfq_id), cid)
+    return _respond(_tools_sourcing.list_quotes(rfq_id), cid)
 
 
 @app.post("/rfqs/{rfq_id}/close")
@@ -1470,7 +1485,8 @@ def close_rfq(
     """Close an OPEN RFQ so no further quotes are accepted. Operator-only."""
     correlation_id = _resolve_correlation_id(cid, req.correlation_id)
     return _respond(
-        tools.close_rfq(rfq_id, correlation_id=correlation_id), correlation_id
+        _tools_sourcing.close_rfq(rfq_id, correlation_id=correlation_id),
+        correlation_id,
     )
 
 
@@ -1484,7 +1500,8 @@ def cancel_rfq(
     """Cancel an OPEN RFQ. Operator-only."""
     correlation_id = _resolve_correlation_id(cid, req.correlation_id)
     return _respond(
-        tools.cancel_rfq(rfq_id, correlation_id=correlation_id), correlation_id
+        _tools_sourcing.cancel_rfq(rfq_id, correlation_id=correlation_id),
+        correlation_id,
     )
 
 
@@ -1498,7 +1515,9 @@ def award_quote(
     """Award an RFQ to one quote and raise the resulting PO. Operator-only."""
     correlation_id = _resolve_correlation_id(cid, req.correlation_id)
     return _respond(
-        tools.award_quote(rfq_id, req.quote_id, correlation_id=correlation_id),
+        _tools_sourcing.award_quote(
+            rfq_id, req.quote_id, correlation_id=correlation_id
+        ),
         correlation_id,
     )
 
@@ -1509,4 +1528,4 @@ def get_quote(
     cid: str = Depends(correlation_id_header),
     principal: tools.Principal = Depends(require_operator),
 ) -> Any:
-    return _respond(tools.get_quote(quote_id), cid)
+    return _respond(_tools_sourcing.get_quote(quote_id), cid)
