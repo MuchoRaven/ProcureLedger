@@ -196,6 +196,61 @@ _TOOL_SCHEMAS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "get_vendor_quotes",
+            "description": (
+                "List every vendor quote for a SKU, ordered by quote_id. "
+                "Read-only."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "sku": {
+                        "type": "string",
+                        "description": "The SKU to list quotes for.",
+                    },
+                },
+                "required": ["sku"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "compare_vendors",
+            "description": (
+                "Rank the vendors that quoted a SKU on price, lead time and "
+                "risk. Read-only."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "sku": {
+                        "type": "string",
+                        "description": "The SKU to compare vendors for.",
+                    },
+                    "weights": {
+                        "type": "object",
+                        "description": (
+                            "Optional partial weights for price, lead_time "
+                            "and risk. Omitted keys default to 0.0; the "
+                            "weights are normalised to sum to 1."
+                        ),
+                    },
+                    "as_of": {
+                        "type": "string",
+                        "description": (
+                            "ISO date for the expiry check; defaults to "
+                            "today (UTC)."
+                        ),
+                    },
+                },
+                "required": ["sku"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "get_po",
             "description": "Read a purchase order record by ID. Read-only.",
             "parameters": {
