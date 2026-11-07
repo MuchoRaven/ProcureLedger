@@ -123,12 +123,12 @@ import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, confloat
+from pydantic import BaseModel, confloat, conint
 
 import agent
 import config
@@ -486,6 +486,11 @@ Amount = confloat(strict=True, gt=0)
 # negative or boolean quantity passed validation and reached the store.
 Quantity = confloat(strict=True, gt=0)
 
+# Non-negative whole days. ``strict=True`` rejects booleans and strings, so the
+# ``isinstance(lead_time_days, bool)`` guard in ``tools.submit_quote`` cannot be
+# reached with a bool. ``conint`` is used for the same v1/v2 reason as above.
+LeadTimeDays = conint(strict=True, ge=0)
+
 # Agent errors that mean "the deployment is broken", not "the run finished".
 _AGENT_FATAL_ERRORS = {"CLIENT_INIT_FAILED", "MODEL_CALL_FAILED"}
 
@@ -626,8 +631,8 @@ class ActionRequest(BaseModel):
 class CreateRFQRequest(BaseModel):
     description: str
     quantity: Quantity
-    vendor_id: str = ""
-    requisition_id: str = ""
+    # ``create_rfq`` takes a list of vendors to invite, not a single vendor.
+    vendor_ids: List[str]
     due_date: str = ""
     currency: str = "USD"
     correlation_id: str = ""
@@ -635,9 +640,12 @@ class CreateRFQRequest(BaseModel):
 
 class SubmitQuoteRequest(BaseModel):
     vendor_id: str
-    amount: Amount
+    # ``submit_quote`` prices per unit and records a lead time, not a total
+    # ``amount``; the PO amount is derived at award time.
+    unit_price: Amount
     currency: str = "USD"
-    valid_until: str = ""
+    lead_time_days: LeadTimeDays = 0
+    valid_until: str
     correlation_id: str = ""
 
 
@@ -929,6 +937,21 @@ def list_approvals() -> Dict[str, Any]:
             "approvals": [
                 dict(appr) for _, appr in sorted(tools._APPROVALS.items())
             ],
+        }
+
+
+def list_rfqs() -> Dict[str, Any]:
+    """Return every RFQ, sorted by ID. App-layer only.
+
+    ``tools`` has no ``list_rfqs`` for the same reason it has no ``list_pos``:
+    a listing needs the whole store, which is exactly the widening
+    ``tools._snapshot_for`` refuses to do. Keeping it here means it can never
+    drift into ``decisions.PROPOSAL_KINDS`` and become model-reachable.
+    """
+    with tools._LOCK:
+        return {
+            "ok": True,
+            "rfqs": [dict(rfq) for _, rfq in sorted(tools._RFQS.items())],
         }
 
 # ---------------------------------------------------------------------------
@@ -1337,3 +1360,137 @@ def execute(
         ),
         correlation_id,
     )
+
+# ---------------------------------------------------------------------------
+# Phase 1 endpoints: RFQs and quotes
+# ---------------------------------------------------------------------------
+#
+# Operator-only and app-layer only. None of these tools are in
+# ``decisions.PROPOSAL_KINDS``, so the model cannot reach them; the operator
+# credential is required for every one, matching the procurement mutations
+# above. ``award_quote`` raises the PO through the existing ``create_po`` path,
+# so an award inherits the ``PO_CREATED`` audit entry.
+
+
+@app.post("/rfqs")
+def create_rfq(
+    req: CreateRFQRequest,
+    cid: str = Depends(correlation_id_header),
+    principal: tools.Principal = Depends(require_operator),
+) -> Any:
+    """Open a request for quotes. Operator-only; never reachable by the model."""
+    correlation_id = _resolve_correlation_id(cid, req.correlation_id)
+    return _respond(
+        tools.create_rfq(
+            req.description,
+            req.quantity,
+            req.currency,
+            req.vendor_ids,
+            due_date=req.due_date,
+            correlation_id=correlation_id,
+        ),
+        correlation_id,
+    )
+
+
+@app.get("/rfqs")
+def rfq_index(
+    cid: str = Depends(correlation_id_header),
+    principal: tools.Principal = Depends(require_operator),
+) -> Any:
+    """List every RFQ. App-layer only; the model cannot reach this."""
+    return _respond(list_rfqs(), cid)
+
+
+@app.get("/rfqs/{rfq_id}")
+def get_rfq(
+    rfq_id: str,
+    cid: str = Depends(correlation_id_header),
+    principal: tools.Principal = Depends(require_operator),
+) -> Any:
+    return _respond(tools.get_rfq(rfq_id), cid)
+
+
+@app.post("/rfqs/{rfq_id}/quotes")
+def submit_quote(
+    rfq_id: str,
+    req: SubmitQuoteRequest,
+    cid: str = Depends(correlation_id_header),
+    principal: tools.Principal = Depends(require_operator),
+) -> Any:
+    """Submit a vendor quote against an OPEN RFQ. Operator-only."""
+    correlation_id = _resolve_correlation_id(cid, req.correlation_id)
+    return _respond(
+        tools.submit_quote(
+            rfq_id,
+            req.vendor_id,
+            req.unit_price,
+            req.currency,
+            req.lead_time_days,
+            req.valid_until,
+            correlation_id=correlation_id,
+        ),
+        correlation_id,
+    )
+
+
+@app.get("/rfqs/{rfq_id}/quotes")
+def rfq_quotes(
+    rfq_id: str,
+    cid: str = Depends(correlation_id_header),
+    principal: tools.Principal = Depends(require_operator),
+) -> Any:
+    """List every quote on an RFQ. App-layer only."""
+    return _respond(tools.list_quotes(rfq_id), cid)
+
+
+@app.post("/rfqs/{rfq_id}/close")
+def close_rfq(
+    rfq_id: str,
+    req: ActionRequest,
+    cid: str = Depends(correlation_id_header),
+    principal: tools.Principal = Depends(require_operator),
+) -> Any:
+    """Close an OPEN RFQ so no further quotes are accepted. Operator-only."""
+    correlation_id = _resolve_correlation_id(cid, req.correlation_id)
+    return _respond(
+        tools.close_rfq(rfq_id, correlation_id=correlation_id), correlation_id
+    )
+
+
+@app.post("/rfqs/{rfq_id}/cancel")
+def cancel_rfq(
+    rfq_id: str,
+    req: ActionRequest,
+    cid: str = Depends(correlation_id_header),
+    principal: tools.Principal = Depends(require_operator),
+) -> Any:
+    """Cancel an OPEN RFQ. Operator-only."""
+    correlation_id = _resolve_correlation_id(cid, req.correlation_id)
+    return _respond(
+        tools.cancel_rfq(rfq_id, correlation_id=correlation_id), correlation_id
+    )
+
+
+@app.post("/rfqs/{rfq_id}/award")
+def award_quote(
+    rfq_id: str,
+    req: AwardQuoteRequest,
+    cid: str = Depends(correlation_id_header),
+    principal: tools.Principal = Depends(require_operator),
+) -> Any:
+    """Award an RFQ to one quote and raise the resulting PO. Operator-only."""
+    correlation_id = _resolve_correlation_id(cid, req.correlation_id)
+    return _respond(
+        tools.award_quote(rfq_id, req.quote_id, correlation_id=correlation_id),
+        correlation_id,
+    )
+
+
+@app.get("/quotes/{quote_id}")
+def get_quote(
+    quote_id: str,
+    cid: str = Depends(correlation_id_header),
+    principal: tools.Principal = Depends(require_operator),
+) -> Any:
+    return _respond(tools.get_quote(quote_id), cid)
