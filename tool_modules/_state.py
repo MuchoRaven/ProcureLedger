@@ -30,7 +30,7 @@ import os
 import re
 import threading
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 _LOG = logging.getLogger(__name__)
@@ -51,6 +51,7 @@ REQ_STATUS_CONVERTED = "CONVERTED"
 REQ_STATUS_CANCELLED = "CANCELLED"
 
 RFQ_STATUS_OPEN = "OPEN"
+RFQ_STATUS_CLOSED = "CLOSED"
 RFQ_STATUS_AWARDED = "AWARDED"
 RFQ_STATUS_CANCELLED = "CANCELLED"
 
@@ -582,10 +583,22 @@ def _commit(
 #
 # NOTE: this is a representative seed. Replace it with the real ERP seed (or
 # load it from ``config.SEED_PATH``) before running against production data.
+#
+# The dataset is deliberately wider than the minimum needed to boot: every
+# status the UI renders has at least one row, so a fresh install shows a
+# populated console rather than a set of empty tables. Dates are relative to
+# the day the process starts, so the late/outstanding views stay meaningful
+# instead of drifting into "everything is overdue" as the seed ages.
 
 
 def _seed_state() -> None:
     """Populate the in-memory state with the baseline dataset."""
+    today = datetime.now(timezone.utc).date()
+
+    def _d(offset: int) -> str:
+        """An ISO date ``offset`` days from today (negative = past)."""
+        return (today + timedelta(days=offset)).isoformat()
+
     _VENDORS.update(
         {
             "VEND-001": {
@@ -624,6 +637,24 @@ def _seed_state() -> None:
                 "payment_terms": "NET15",
                 "lead_time_days": 5,
             },
+            "VEND-005": {
+                "vendor_id": "VEND-005",
+                "name": "Northwind Fasteners",
+                "status": "ACTIVE",
+                "risk_tier": "LOW",
+                "currency": "USD",
+                "payment_terms": "NET30",
+                "lead_time_days": 10,
+            },
+            "VEND-006": {
+                "vendor_id": "VEND-006",
+                "name": "Stark Precision Tools",
+                "status": "ACTIVE",
+                "risk_tier": "MEDIUM",
+                "currency": "USD",
+                "payment_terms": "NET60",
+                "lead_time_days": 30,
+            },
         }
     )
     _POS.update(
@@ -648,6 +679,47 @@ def _seed_state() -> None:
                 "requisition_id": None,
                 "created_at": _now(),
             },
+            "PO-1003": {
+                "po_id": "PO-1003",
+                "vendor_id": "VEND-001",
+                "amount": 4200.00,
+                "currency": "USD",
+                "status": PO_STATUS_OPEN,
+                "expected_delivery": _d(14),
+                "requisition_id": None,
+                "created_at": _now(),
+            },
+            "PO-1004": {
+                "po_id": "PO-1004",
+                "vendor_id": "VEND-002",
+                "amount": 9600.00,
+                "currency": "USD",
+                "status": PO_STATUS_OPEN,
+                "expected_delivery": _d(-21),
+                "requisition_id": None,
+                "created_at": _now(),
+            },
+            "PO-1005": {
+                "po_id": "PO-1005",
+                "vendor_id": "VEND-004",
+                "amount": 3000.00,
+                "currency": "USD",
+                "status": PO_STATUS_CLOSED,
+                "expected_delivery": _d(-40),
+                "requisition_id": None,
+                "rfq_id": "RFQ-5003",
+                "created_at": _now(),
+            },
+            "PO-1006": {
+                "po_id": "PO-1006",
+                "vendor_id": "VEND-003",
+                "amount": 1500.00,
+                "currency": "USD",
+                "status": PO_STATUS_CANCELLED,
+                "expected_delivery": _d(-5),
+                "requisition_id": None,
+                "created_at": _now(),
+            },
         }
     )
     _RECEIPTS.update(
@@ -664,6 +736,18 @@ def _seed_state() -> None:
                 "amount": 800.00,
                 "received_at": _now(),
             },
+            "RCPT-3003": {
+                "receipt_id": "RCPT-3003",
+                "po_id": "PO-1003",
+                "amount": 2000.00,
+                "received_at": _now(),
+            },
+            "RCPT-3004": {
+                "receipt_id": "RCPT-3004",
+                "po_id": "PO-1005",
+                "amount": 3000.00,
+                "received_at": _now(),
+            },
         }
     )
     _INVOICES.update(
@@ -674,9 +758,9 @@ def _seed_state() -> None:
                 "po_id": "PO-1001",
                 "amount": 12500.00,
                 "currency": "USD",
-                "status": "RECEIVED",
+                "status": "MATCHED",
                 "receipt_ids": ["RCPT-3001"],
-                "due_date": "2024-01-31",
+                "due_date": _d(-10),
                 "created_at": _now(),
                 "updated_at": _now(),
             },
@@ -688,7 +772,95 @@ def _seed_state() -> None:
                 "currency": "USD",
                 "status": "RECEIVED",
                 "receipt_ids": ["RCPT-3002"],
-                "due_date": "2024-02-29",
+                "due_date": _d(20),
+                "created_at": _now(),
+                "updated_at": _now(),
+            },
+            "INV-2003": {
+                "invoice_id": "INV-2003",
+                "vendor_id": "VEND-001",
+                "po_id": "PO-1003",
+                "amount": 2000.00,
+                "currency": "USD",
+                "status": "PENDING_APPROVAL",
+                "receipt_ids": ["RCPT-3003"],
+                "due_date": _d(30),
+                "created_at": _now(),
+                "updated_at": _now(),
+            },
+            "INV-2004": {
+                "invoice_id": "INV-2004",
+                "vendor_id": "VEND-002",
+                "po_id": "PO-1004",
+                "amount": 9600.00,
+                "currency": "USD",
+                "status": "EXCEPTION",
+                "receipt_ids": [],
+                "due_date": _d(-5),
+                "created_at": _now(),
+                "updated_at": _now(),
+            },
+            "INV-2005": {
+                "invoice_id": "INV-2005",
+                "vendor_id": "VEND-004",
+                "po_id": "PO-1005",
+                "amount": 3000.00,
+                "currency": "USD",
+                "status": "APPROVED",
+                "receipt_ids": ["RCPT-3004"],
+                "due_date": _d(-30),
+                "created_at": _now(),
+                "updated_at": _now(),
+            },
+            "INV-2006": {
+                "invoice_id": "INV-2006",
+                "vendor_id": "VEND-001",
+                "po_id": "PO-1001",
+                "amount": 12500.00,
+                "currency": "USD",
+                "status": "EXCEPTION",
+                "receipt_ids": ["RCPT-3001"],
+                "due_date": _d(-10),
+                "created_at": _now(),
+                "updated_at": _now(),
+            },
+        }
+    )
+    _APPROVALS.update(
+        {
+            "APR-8001": {
+                "approval_id": "APR-8001",
+                "vendor_id": "VEND-001",
+                "po_id": "PO-1003",
+                "invoice_id": "INV-2003",
+                "amount": 2000.00,
+                "status": "PENDING",
+                "created_at": _now(),
+                "updated_at": _now(),
+            },
+            "APR-8002": {
+                "approval_id": "APR-8002",
+                "vendor_id": "VEND-002",
+                "po_id": "PO-1002",
+                "invoice_id": "INV-2002",
+                "amount": 800.00,
+                "status": "APPROVED",
+                "approver": "operator",
+                "approved_at": _now(),
+                "created_at": _now(),
+                "updated_at": _now(),
+            },
+            "APR-8003": {
+                "approval_id": "APR-8003",
+                "vendor_id": "VEND-004",
+                "po_id": "PO-1005",
+                "invoice_id": "INV-2005",
+                "amount": 3000.00,
+                "status": "EXECUTED",
+                "approver": "operator",
+                "approved_at": _now(),
+                "executor": "executor",
+                "executed_at": _now(),
                 "created_at": _now(),
                 "updated_at": _now(),
             },
@@ -722,6 +894,32 @@ def _seed_state() -> None:
                 "created_at": _now(),
                 "updated_at": _now(),
             },
+            "REQ-4003": {
+                "requisition_id": "REQ-4003",
+                "description": "Conveyor belt spares",
+                "vendor_id": "VEND-005",
+                "po_id": None,
+                "quantity": 25,
+                "amount": 1875.00,
+                "currency": "USD",
+                "status": REQ_STATUS_OPEN,
+                "requested_by": "operator",
+                "created_at": _now(),
+                "updated_at": _now(),
+            },
+            "REQ-4004": {
+                "requisition_id": "REQ-4004",
+                "description": "Obsolete gasket order",
+                "vendor_id": "VEND-002",
+                "po_id": None,
+                "quantity": 10,
+                "amount": 200.00,
+                "currency": "USD",
+                "status": REQ_STATUS_CANCELLED,
+                "requested_by": "operator",
+                "created_at": _now(),
+                "updated_at": _now(),
+            },
         }
     )
     _RFQS.update(
@@ -731,35 +929,109 @@ def _seed_state() -> None:
                 "description": "Hydraulic fittings, Q2 restock",
                 "quantity": 120,
                 "currency": "USD",
+                "vendor_ids": ["VEND-001", "VEND-002", "VEND-004"],
+                "due_date": _d(7),
                 "status": RFQ_STATUS_OPEN,
                 "awarded_quote_id": None,
+                "po_id": None,
+                "created_at": _now(),
+                "updated_at": _now(),
+            },
+            "RFQ-5002": {
+                "rfq_id": "RFQ-5002",
+                "description": "Gasket sets, annual contract",
+                "quantity": 50,
+                "currency": "USD",
+                "vendor_ids": ["VEND-001", "VEND-005"],
+                "due_date": _d(-3),
+                "status": RFQ_STATUS_CLOSED,
+                "awarded_quote_id": None,
+                "po_id": None,
+                "created_at": _now(),
+                "updated_at": _now(),
+            },
+            "RFQ-5003": {
+                "rfq_id": "RFQ-5003",
+                "description": "Precision tooling, awarded",
+                "quantity": 50,
+                "currency": "USD",
+                "vendor_ids": ["VEND-004", "VEND-006"],
+                "due_date": _d(-45),
+                "status": RFQ_STATUS_AWARDED,
+                "awarded_quote_id": "QTE-6005",
+                "po_id": "PO-1005",
                 "created_at": _now(),
                 "updated_at": _now(),
             },
         }
     )
+    # ``"SUBMITTED"`` is a literal on purpose. ``_state`` must not import
+    # ``_codes`` (see the module docstring), and the local
+    # ``QUOTE_STATUS_RECEIVED`` is the stale value that made the Sourcing
+    # drawer read ``unit_price`` off a record that had ``amount`` and render
+    # ``$NaN``. ``_tools_sourcing.submit_quote`` writes ``"SUBMITTED"``, so the
+    # seed has to agree with it or the Award button never appears.
     _QUOTES.update(
         {
-            "QUO-6001": {
-                "quote_id": "QUO-6001",
+            "QTE-6001": {
+                "quote_id": "QTE-6001",
                 "rfq_id": "RFQ-5001",
                 "vendor_id": "VEND-001",
-                "amount": 14400.00,
+                "unit_price": 120.00,
                 "currency": "USD",
                 "lead_time_days": 7,
-                "status": QUOTE_STATUS_RECEIVED,
-                "created_at": _now(),
+                "valid_until": _d(30),
+                "status": "SUBMITTED",
+                "submitted_at": _now(),
                 "updated_at": _now(),
             },
-            "QUO-6002": {
-                "quote_id": "QUO-6002",
+            "QTE-6002": {
+                "quote_id": "QTE-6002",
                 "rfq_id": "RFQ-5001",
                 "vendor_id": "VEND-002",
-                "amount": 13800.00,
+                "unit_price": 115.00,
                 "currency": "USD",
                 "lead_time_days": 14,
-                "status": QUOTE_STATUS_RECEIVED,
-                "created_at": _now(),
+                "valid_until": _d(30),
+                "status": "SUBMITTED",
+                "submitted_at": _now(),
+                "updated_at": _now(),
+            },
+            "QTE-6003": {
+                "quote_id": "QTE-6003",
+                "rfq_id": "RFQ-5001",
+                "vendor_id": "VEND-004",
+                "unit_price": 110.00,
+                "currency": "USD",
+                "lead_time_days": 5,
+                "valid_until": _d(30),
+                "status": "SUBMITTED",
+                "submitted_at": _now(),
+                "updated_at": _now(),
+            },
+            "QTE-6004": {
+                "quote_id": "QTE-6004",
+                "rfq_id": "RFQ-5002",
+                "vendor_id": "VEND-001",
+                "unit_price": 20.00,
+                "currency": "USD",
+                "lead_time_days": 7,
+                "valid_until": _d(30),
+                "status": "SUBMITTED",
+                "submitted_at": _now(),
+                "updated_at": _now(),
+            },
+            "QTE-6005": {
+                "quote_id": "QTE-6005",
+                "rfq_id": "RFQ-5003",
+                "vendor_id": "VEND-004",
+                "unit_price": 60.00,
+                "currency": "USD",
+                "lead_time_days": 5,
+                "valid_until": _d(30),
+                "status": QUOTE_STATUS_AWARDED,
+                "submitted_at": _now(),
+                "awarded_at": _now(),
                 "updated_at": _now(),
             },
         }
