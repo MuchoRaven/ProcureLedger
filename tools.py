@@ -114,7 +114,7 @@ from tool_modules._state import (
     _compute_hash,
     _persist_audit_entry as _persist_audit,
     _reset_state,
-    _reset_phase0_state,
+    _reset_phase0_state,  # noqa: F401 - re-exported for tests
     GENESIS_HASH,
     PO_STATUS_OPEN,
     PO_STATUS_CLOSED,
