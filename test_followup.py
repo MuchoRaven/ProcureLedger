@@ -153,3 +153,25 @@ def test_list_late_pos_reports_days_late_and_includes_notified(clean_state):
 
     # Already-notified POs are still included.
     assert "PO-1001" in by_id
+
+
+def test_audit_write_failure_leaves_late_flag_unset(clean_state, monkeypatch):
+    """A failed audit write must not leave an unrecorded late flag.
+
+    ``_commit`` writes the audit link before running the mutation, so a
+    ``ToolError`` from ``_persist_audit`` propagates out of ``_commit`` and the
+    mutation never runs. ``_apply_flag_late`` catches that ``ToolError`` and
+    returns it as a result dict rather than raising, so the caller sees
+    ``AUDIT_WRITE_FAILED`` and ``late_flagged_at`` stays unset.
+    """
+
+    def _fail_audit_write(entry):
+        raise tools.ToolError("AUDIT_WRITE_FAILED", "simulated")
+
+    monkeypatch.setattr(tools, "_persist_audit", _fail_audit_write)
+
+    result = _apply_flag_late("PO-1001", "2024-03-01", "cid")
+
+    assert result["ok"] is False
+    assert result["error"] == "AUDIT_WRITE_FAILED"
+    assert "late_flagged_at" not in tools._POS["PO-1001"]
