@@ -5,6 +5,9 @@ Facade over ``tool_modules``. Every tool body lives in a submodule; this
 module only re-exports, so ``agent``, ``app``, ``sandbox`` and the tests keep
 reaching them through ``tools``. The private names are temporary - drop them
 once those callers import from ``tool_modules`` directly.
+
+The Phase 0 caveat lives in ``tool_modules._codes``; the ``_persist_audit``
+re-export note lives in ``tool_modules._state``.
 """
 
 from __future__ import annotations
@@ -16,16 +19,12 @@ from tool_modules._state import (
     _INVOICES,
     _APPROVALS,
     _REQUISITIONS,
-    _RFQS,
-    _QUOTES,
-    _STOCK,
     ToolError,
     Principal,
     _load_audit_from_file,
     _audit_entries,
     _persist_audit_entry as _persist_audit,
     _reset_state,
-    _reset_phase0_state,
     AMOUNT_TOLERANCE,
 )
 
@@ -122,10 +121,9 @@ __all__ = [
     "_as_float", "_utc_today",
     # State and types (temporary; drop once callers import from tool_modules)
     "_LOCK", "_POS", "_RECEIPTS", "_INVOICES", "_APPROVALS", "_REQUISITIONS",
-    "_RFQS", "_QUOTES", "_STOCK",
     "ToolError", "Principal",
     "_load_audit_from_file", "_audit_entries", "_persist_audit",
-    "_reset_state", "_reset_phase0_state",
+    "_reset_state",
     "AMOUNT_TOLERANCE",
     # Codes
     "PHASE0_ERROR_CODES",

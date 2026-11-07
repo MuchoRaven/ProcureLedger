@@ -142,6 +142,8 @@ from tool_modules import (
     _tools_sourcing,
 )
 
+from tool_modules._state import _RFQS
+
 from tool_modules._codes import (
     RFQ_NOT_FOUND,
     RFQ_NOT_OPEN,
@@ -974,7 +976,7 @@ def list_rfqs() -> Dict[str, Any]:
     with tools._LOCK:
         return {
             "ok": True,
-            "rfqs": [dict(rfq) for _, rfq in sorted(tools._RFQS.items())],
+            "rfqs": [dict(rfq) for _, rfq in sorted(_RFQS.items())],
         }
 
 # ---------------------------------------------------------------------------

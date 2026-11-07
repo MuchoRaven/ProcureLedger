@@ -10,6 +10,14 @@ imports anything but ``__future__``; it is pure data.
 
 The string values are unchanged, so ``tools.RFQ_NOT_FOUND`` and friends keep
 resolving to the same strings they always did.
+
+Phase 0 caveat
+--------------
+The error codes the Phase 0 and Phase 1 tools raise are declared here as
+constants and re-exported by ``tools``, so the apply helpers and
+``app._TOOL_ERROR_STATUS`` cannot drift on a typo. ``PHASE0_ERROR_CODES`` is
+the set a test can assert is fully mapped in ``app``: every member must be a
+key in ``_TOOL_ERROR_STATUS``, or a Phase 0 failure surfaces as a 400.
 """
 
 from __future__ import annotations
