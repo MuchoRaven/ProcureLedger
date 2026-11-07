@@ -97,3 +97,34 @@ def test_closed_po_is_never_flagged(clean_state):
 
     assert "PO-1001" not in result["flagged"]
     assert "PO-1002" in result["flagged"]
+
+
+def test_notify_delay_on_unflagged_po_returns_po_not_late(clean_state):
+    """Notifying on a PO that was never flagged is refused, not applied.
+
+    ``_apply_notify_delay`` returns the error dict; it does not raise. The
+    ``check`` callable raises ``PO_NOT_LATE`` because ``late_flagged_at`` is
+    unset, so the mutation never runs and no ``delay_notified_at`` is written.
+    """
+    result = _apply_notify_delay("PO-1001", "alice", "cid")
+
+    assert result["ok"] is False
+    assert result["error"] == "PO_NOT_LATE"
+    assert "delay_notified_at" not in tools._POS["PO-1001"]
+
+
+def test_notify_delay_writes_event_and_is_idempotent(clean_state):
+    """A flagged PO can be notified once; a second call is a skip, not a write."""
+    _apply_flag_late("PO-1001", "2024-03-01", "cid")
+
+    result = _apply_notify_delay("PO-1001", "alice", "cid")
+
+    assert result["ok"] is True
+    assert tools._POS["PO-1001"]["delay_notified_by"] == "alice"
+    assert len(_events("DELAY_NOTIFIED")) == 1
+
+    result2 = _apply_notify_delay("PO-1001", "alice", "cid")
+
+    assert result2["ok"] is True
+    assert result2["skipped"] is True
+    assert len(_events("DELAY_NOTIFIED")) == 1
