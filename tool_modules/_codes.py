@@ -72,6 +72,18 @@ PO_NOT_LATE = "PO_NOT_LATE"
 
 
 # ---------------------------------------------------------------------------
+# Vendor-comparison error codes
+# ---------------------------------------------------------------------------
+#
+# Raised by the SKU-scoped vendor-quote tools. Declared here rather than as
+# bare strings so the tools and ``app._TOOL_ERROR_STATUS`` cannot drift on a
+# typo, matching the Phase 0 codes above.
+
+NO_QUOTES_FOR_SKU = "NO_QUOTES_FOR_SKU"
+INVALID_WEIGHTS = "INVALID_WEIGHTS"
+
+
+# ---------------------------------------------------------------------------
 # Phase 1 status values
 # ---------------------------------------------------------------------------
 #
