@@ -12,6 +12,7 @@ import { Invoices } from './views/Invoices';
 import { Sourcing } from './views/Sourcing';
 import { Followup } from './views/Followup';
 import { Audit } from './views/Audit';
+import { Settlement } from './views/Settlement';
 import type { Role } from './api/types';
 
 /**
@@ -38,9 +39,9 @@ const NAV: Record<Role, NavItem[]> = {
 };
 
 /**
- * The operator views are real as of Phase 3. The executor and agent consoles
- * are still placeholders, so they keep the ``ComingSoon`` shell rather than
- * being routed to a view that does not exist.
+ * The operator views are real as of Phase 3 and the executor queue as of
+ * Phase 4. The agent console is still a placeholder, so it keeps the
+ * ``ComingSoon`` shell rather than being routed to a view that does not exist.
  */
 function View({
   id,
@@ -69,13 +70,7 @@ function View({
     case 'audit':
       return <Audit />;
     case 'settlement':
-      return (
-        <ComingSoon
-          label={label}
-          phase="Phase 4"
-          note="APPROVED approvals only. Separation of duties is enforced server-side, so a self-settlement is a 409."
-        />
-      );
+      return <Settlement />;
     case 'console':
       return (
         <ComingSoon
