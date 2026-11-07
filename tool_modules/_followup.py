@@ -225,3 +225,110 @@ def run_followup(as_of: str = "") -> dict:
         "skipped": skipped,
         "errors": errors,
     }
+
+
+def _apply_notify_delay(
+    po_id: str, notified_by: str, correlation_id: str = ""
+) -> dict:
+    """Record that a late PO's delay has been notified, idempotently.
+
+    Reads ``late_flagged_at`` under ``_LOCK`` for the audit payload. A missing
+    PO is reported without calling ``_commit``: the check would raise the same
+    code, so this is equivalent and avoids a ``KeyError`` on the read above.
+
+    ``check`` raises rather than returns - it is ``_commit``'s
+    ``Callable[[], None]``. The already-notified case is a sentinel raise that
+    the caller turns into a skip, mirroring ``_apply_flag_late``. That is what
+    makes a re-run report the same PO as skipped instead of notifying twice.
+    """
+    with _LOCK:
+        po = _POS.get(po_id)
+        if po is None:
+            return {
+                "ok": False,
+                "error": "PO_NOT_FOUND",
+                "detail": {"po_id": po_id},
+            }
+        late_flagged_at = po.get("late_flagged_at")
+
+    def check() -> None:
+        with _LOCK:
+            current = _POS.get(po_id)
+            if current is None:
+                raise ToolError("PO_NOT_FOUND", {"po_id": po_id})
+            if current.get("status") != PO_STATUS_OPEN:
+                raise ToolError(
+                    "PO_NOT_OPEN",
+                    {"po_id": po_id, "status": current.get("status")},
+                )
+            if not current.get("late_flagged_at"):
+                raise ToolError(
+                    PO_NOT_LATE,
+                    {
+                        "po_id": po_id,
+                        "late_flagged_at": current.get("late_flagged_at"),
+                    },
+                )
+            if current.get("delay_notified_at"):
+                raise ToolError(
+                    _DELAY_ALREADY_NOTIFIED,
+                    {
+                        "po_id": po_id,
+                        "delay_notified_at": current.get("delay_notified_at"),
+                    },
+                )
+
+    def mutation() -> None:
+        with _LOCK:
+            record = _POS[po_id]
+            record["delay_notified_at"] = _now()
+            record["delay_notified_by"] = notified_by
+
+    payload = {
+        "po_id": po_id,
+        "notified_by": notified_by,
+        "late_flagged_at": late_flagged_at,
+    }
+
+    try:
+        _commit(
+            mutation,
+            "DELAY_NOTIFIED",
+            payload,
+            correlation_id,
+            check=check,
+        )
+    except ToolError as exc:
+        if exc.code == _DELAY_ALREADY_NOTIFIED:
+            return {"ok": True, "skipped": True, "po_id": po_id}
+        return {"ok": False, "error": exc.code, "detail": exc.detail}
+
+    return {"ok": True, "po_id": po_id}
+
+
+def list_late_pos(as_of: str = "") -> dict:
+    """Return every late PO as of ``as_of``, flagged or not.
+
+    The worklist answers "what is late", not "what is newly late", so an
+    already-flagged PO is included. Each entry is a copy of the PO dict plus
+    ``days_late``; the copy matters because the caller must not be able to
+    mutate the live store through the result.
+
+    ``_is_late`` has already validated ``expected_delivery`` as an ISO date,
+    so the ``date.fromisoformat`` below cannot raise for an entry that made it
+    into the list.
+    """
+    reference = _resolve_as_of(as_of)
+    with _LOCK:
+        entries: list[dict] = []
+        for po_id, po in sorted(_POS.items()):
+            if not _is_late(po, reference):
+                continue
+            entry = dict(po)
+            entry["days_late"] = (
+                date.fromisoformat(reference)
+                - date.fromisoformat(po["expected_delivery"])
+            ).days
+            entries.append(entry)
+
+    return {"ok": True, "as_of": reference, "pos": entries}
