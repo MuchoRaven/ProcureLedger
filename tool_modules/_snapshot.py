@@ -30,6 +30,7 @@ from tool_modules._state import (
     _RFQS,
     _QUOTES,
     _STOCK,
+    _VENDOR_QUOTES,
 )
 from tool_modules._util import _utc_today
 
@@ -46,6 +47,7 @@ def _snapshot_for(
     rfq_id: Optional[str] = None,
     quote_id: Optional[str] = None,
     item_id: Optional[str] = None,
+    sku: Optional[str] = None,
     as_of: Optional[str] = None,
     **_ignored: Any,
 ) -> dict[str, Any]:
@@ -64,6 +66,11 @@ def _snapshot_for(
     * ``rfq_id``         -> RFQ, its quotes, their vendors, its requisition
     * ``quote_id``       -> quote, its RFQ, its vendor
     * ``item_id``        -> stock item, its vendor
+    * ``sku``            -> every vendor quote for that SKU, and their vendors
+
+    ``sku`` is the one selector that widens rather than narrows: a vendor
+    comparison needs every quote for the SKU, not one. It is still bounded by
+    the SKU, so the snapshot never becomes the whole store.
 
     ``as_of`` is always present: ``decisions._decide_get_invoice_aging`` falls
     back to it when the caller omits the argument. An explicit, valid ISO
@@ -87,6 +94,7 @@ def _snapshot_for(
     rfqs: dict[str, Any] = {}
     quotes: dict[str, Any] = {}
     stock: dict[str, Any] = {}
+    vendor_quotes: dict[str, Any] = {}
 
     with _LOCK:
 
@@ -177,6 +185,13 @@ def _snapshot_for(
             stock[iid] = item
             add_vendor(item.get("vendor_id"))
 
+        def add_vendor_quote(qid: Optional[str]) -> None:
+            if not qid or qid not in _VENDOR_QUOTES or qid in vendor_quotes:
+                return
+            quote = dict(_VENDOR_QUOTES[qid])
+            vendor_quotes[qid] = quote
+            add_vendor(quote.get("vendor_id"))
+
         if invoice_id:
             add_invoice(invoice_id)
         if po_id:
@@ -195,6 +210,13 @@ def _snapshot_for(
             add_quote(quote_id)
         if item_id:
             add_stock(item_id)
+        if sku:
+            # ``sku`` widens rather than narrows: a vendor comparison needs
+            # every quote for the SKU, not one. Still bounded by the SKU, so
+            # the snapshot never becomes the whole store.
+            for qid, quote in _VENDOR_QUOTES.items():
+                if quote.get("sku") == sku:
+                    add_vendor_quote(qid)
 
     reference = _utc_today()
     if isinstance(as_of, str) and as_of.strip():
@@ -216,4 +238,5 @@ def _snapshot_for(
         "rfqs": rfqs,
         "quotes": quotes,
         "stock": stock,
+        "vendor_quotes": vendor_quotes,
     }
