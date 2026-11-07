@@ -162,6 +162,7 @@ _REQUISITIONS: dict[str, dict[str, Any]] = {}
 _RFQS: dict[str, dict[str, Any]] = {}
 _QUOTES: dict[str, dict[str, Any]] = {}
 _STOCK: dict[str, dict[str, Any]] = {}
+_VENDOR_QUOTES: dict[str, dict[str, Any]] = {}
 _EXCEPTIONS: dict[str, dict[str, Any]] = {}
 
 _AUDIT: list[dict[str, Any]] = []
@@ -763,6 +764,75 @@ def _seed_state() -> None:
             },
         }
     )
+    _VENDOR_QUOTES.update(
+        {
+            "VQ-7001": {
+                "quote_id": "VQ-7001",
+                "vendor_id": "VEND-001",
+                "sku": "SKU-HYD-001",
+                "unit_price": 120.00,
+                "currency": "USD",
+                "lead_time_days": 7,
+                "moq": 10,
+                "valid_until": "2025-12-31",
+                "payment_terms": "NET30",
+                "risk_tier": "LOW",
+                "status": "ACTIVE",
+            },
+            "VQ-7002": {
+                "quote_id": "VQ-7002",
+                "vendor_id": "VEND-002",
+                "sku": "SKU-HYD-001",
+                "unit_price": 115.00,
+                "currency": "USD",
+                "lead_time_days": 14,
+                "moq": 20,
+                "valid_until": "2025-12-31",
+                "payment_terms": "NET45",
+                "risk_tier": "MEDIUM",
+                "status": "ACTIVE",
+            },
+            "VQ-7003": {
+                "quote_id": "VQ-7003",
+                "vendor_id": "VEND-004",
+                "sku": "SKU-HYD-001",
+                "unit_price": 110.00,
+                "currency": "USD",
+                "lead_time_days": 5,
+                "moq": 5,
+                "valid_until": "2025-12-31",
+                "payment_terms": "NET15",
+                "risk_tier": "HIGH",
+                "status": "ACTIVE",
+            },
+            "VQ-7004": {
+                "quote_id": "VQ-7004",
+                "vendor_id": "VEND-001",
+                "sku": "SKU-GSK-002",
+                "unit_price": 20.00,
+                "currency": "USD",
+                "lead_time_days": 7,
+                "moq": 10,
+                "valid_until": "2025-12-31",
+                "payment_terms": "NET30",
+                "risk_tier": "LOW",
+                "status": "ACTIVE",
+            },
+            "VQ-7005": {
+                "quote_id": "VQ-7005",
+                "vendor_id": "VEND-002",
+                "sku": "SKU-GSK-002",
+                "unit_price": 18.00,
+                "currency": "USD",
+                "lead_time_days": 14,
+                "moq": 20,
+                "valid_until": "2025-12-31",
+                "payment_terms": "NET45",
+                "risk_tier": "MEDIUM",
+                "status": "ACTIVE",
+            },
+        }
+    )
     # ``_EXCEPTIONS`` is deliberately empty: exceptions are opened by the
     # detector and the match path, so seeding one would make a fresh install
     # look like it already had an unresolved problem.
@@ -856,7 +926,7 @@ def _truncate_audit_log() -> None:
 
 
 def _reset_phase0_state() -> None:
-    """Clear the Phase 0 stores: RFQs, quotes and stock.
+    """Clear the Phase 0 stores: RFQs, quotes, stock and vendor quotes.
 
     Called by ``_reset_state`` so a test reset covers them too. Kept as a
     separate function so a caller that only wants to clear the Phase 0
@@ -866,6 +936,7 @@ def _reset_phase0_state() -> None:
         _RFQS.clear()
         _QUOTES.clear()
         _STOCK.clear()
+        _VENDOR_QUOTES.clear()
 
 
 def _reset_state() -> None:
