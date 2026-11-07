@@ -134,7 +134,7 @@ class Principal:
     """
 
     sub: str
-    roles: Tuple[str, ...] = field(default_factory=tuple)
+    roles: tuple[str, ...] = field(default_factory=tuple)
     email: str = ""
     auth_method: str = "service"
 
@@ -148,18 +148,18 @@ class Principal:
 
 _LOCK = threading.RLock()
 
-_VENDORS: Dict[str, Dict[str, Any]] = {}
-_POS: Dict[str, Dict[str, Any]] = {}
-_RECEIPTS: Dict[str, Dict[str, Any]] = {}
-_INVOICES: Dict[str, Dict[str, Any]] = {}
-_APPROVALS: Dict[str, Dict[str, Any]] = {}
-_REQUISITIONS: Dict[str, Dict[str, Any]] = {}
-_RFQS: Dict[str, Dict[str, Any]] = {}
-_QUOTES: Dict[str, Dict[str, Any]] = {}
-_STOCK: Dict[str, Dict[str, Any]] = {}
-_EXCEPTIONS: Dict[str, Dict[str, Any]] = {}
+_VENDORS: dict[str, dict[str, Any]] = {}
+_POS: dict[str, dict[str, Any]] = {}
+_RECEIPTS: dict[str, dict[str, Any]] = {}
+_INVOICES: dict[str, dict[str, Any]] = {}
+_APPROVALS: dict[str, dict[str, Any]] = {}
+_REQUISITIONS: dict[str, dict[str, Any]] = {}
+_RFQS: dict[str, dict[str, Any]] = {}
+_QUOTES: dict[str, dict[str, Any]] = {}
+_STOCK: dict[str, dict[str, Any]] = {}
+_EXCEPTIONS: dict[str, dict[str, Any]] = {}
 
-_AUDIT: List[Dict[str, Any]] = []
+_AUDIT: list[dict[str, Any]] = []
 _AUDIT_SEQ: int = 0
 
 # ---------------------------------------------------------------------------
@@ -210,14 +210,14 @@ def _payment_terms_days(terms: Optional[str]) -> Optional[int]:
 # ---------------------------------------------------------------------------
 
 
-def _compute_hash(entry: Dict[str, Any]) -> str:
+def _compute_hash(entry: dict[str, Any]) -> str:
     """Hash an audit entry, excluding the ``hash`` field itself."""
     canonical = {k: v for k, v in entry.items() if k != "hash"}
     blob = json.dumps(canonical, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 
-def _head_hash(entries: List[Dict[str, Any]]) -> str:
+def _head_hash(entries: list[dict[str, Any]]) -> str:
     """Return the hash of the last entry, or the genesis hash if empty."""
     if not entries:
         return GENESIS_HASH
@@ -244,7 +244,7 @@ def _audit_recovery_mode() -> str:
         return "fail"
 
 
-def _load_audit_from_file() -> List[Dict[str, Any]]:
+def _load_audit_from_file() -> list[dict[str, Any]]:
     """Read the durable audit log.
 
     A torn *trailing* line is tolerated: it means the process died mid-append,
@@ -266,7 +266,7 @@ def _load_audit_from_file() -> List[Dict[str, Any]]:
     populated = [i for i, line in enumerate(raw_lines) if line.strip()]
     last_populated = populated[-1] if populated else -1
 
-    entries: List[Dict[str, Any]] = []
+    entries: list[dict[str, Any]] = []
     for index in populated:
         line = raw_lines[index].strip()
         try:
@@ -296,13 +296,13 @@ def _load_audit_from_file() -> List[Dict[str, Any]]:
     return entries
 
 
-def _verify_chain(entries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _verify_chain(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Check sequence continuity, hash linkage and per-entry hashes.
 
     Returns a list of problems; empty means the chain is intact. Reading the
     log without verifying it is what let a tampered file boot cleanly.
     """
-    problems: List[Dict[str, Any]] = []
+    problems: list[dict[str, Any]] = []
     prev_hash = GENESIS_HASH
     expected_seq = 1
     for entry in entries:
@@ -320,7 +320,7 @@ def _verify_chain(entries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return problems
 
 
-def _audit_entries() -> List[Dict[str, Any]]:
+def _audit_entries() -> list[dict[str, Any]]:
     """Return a snapshot of the in-memory audit chain.
 
     Read through this helper rather than importing ``_AUDIT`` directly:
@@ -335,7 +335,7 @@ def _audit_entries() -> List[Dict[str, Any]]:
         return copy.deepcopy(_AUDIT)
 
 
-def _persist_audit_entry(entry: Dict[str, Any]) -> None:
+def _persist_audit_entry(entry: dict[str, Any]) -> None:
     """Append one entry to the durable audit log and flush it to disk.
 
     ``fsync`` is what makes the audit-before-mutation ordering meaningful: a
@@ -352,7 +352,7 @@ def _persist_audit_entry(entry: Dict[str, Any]) -> None:
         raise ToolError("AUDIT_LOG_UNWRITABLE", {"path": path, "error": str(exc)})
 
 
-def _resolve_persist() -> Callable[[Dict[str, Any]], None]:
+def _resolve_persist() -> Callable[[dict[str, Any]], None]:
     """Return the function ``_append_audit`` should use to write one entry.
 
     ``tools`` re-exports ``_persist_audit_entry`` as ``_persist_audit`` so the
@@ -371,10 +371,10 @@ def _resolve_persist() -> Callable[[Dict[str, Any]], None]:
 
 def _append_audit(
     event_type: str,
-    payload: Dict[str, Any],
+    payload: dict[str, Any],
     correlation_id: str = "",
     source: str = "agent",
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Append an entry to the in-memory and durable audit chain.
 
     The durable write happens first: if it fails, ``ToolError`` propagates and
@@ -384,7 +384,7 @@ def _append_audit(
     global _AUDIT_SEQ
     with _LOCK:
         seq = _AUDIT_SEQ + 1
-        entry: Dict[str, Any] = {
+        entry: dict[str, Any] = {
             "seq": seq,
             "event_type": event_type,
             "payload": payload,
@@ -415,14 +415,14 @@ class _EntitySpec:
     that rebinds a module global is still observed.
     """
 
-    store: Callable[[], Dict[str, Dict[str, Any]]]
+    store: Callable[[], dict[str, dict[str, Any]]]
     id_field: str
     not_found_code: str
     status_field: str = "status"
     updated_field: str = "updated_at"
 
 
-_ENTITIES: Dict[str, _EntitySpec] = {
+_ENTITIES: dict[str, _EntitySpec] = {
     "invoice": _EntitySpec(
         store=lambda: _INVOICES,
         id_field="invoice_id",
@@ -467,7 +467,7 @@ def _entity_spec(entity: str) -> _EntitySpec:
 def _check_entity_transition(
     entity: str,
     entity_id: str,
-    from_states: Tuple[str, ...],
+    from_states: tuple[str, ...],
     to_state: str,
 ) -> None:
     """Validate a transition for any registered entity without changing it.
@@ -503,7 +503,7 @@ def _check_entity_transition(
 def _transition_entity(
     entity: str,
     entity_id: str,
-    from_states: Tuple[str, ...],
+    from_states: tuple[str, ...],
     to_state: str,
 ) -> None:
     """Move any registered entity to ``to_state`` if its state allows it.
@@ -521,7 +521,7 @@ def _transition_entity(
 
 def _check_transition(
     invoice_id: str,
-    from_states: Tuple[str, ...],
+    from_states: tuple[str, ...],
     to_state: str,
 ) -> None:
     """Invoice-specific wrapper kept for existing callers.
@@ -534,7 +534,7 @@ def _check_transition(
 
 def _transition(
     invoice_id: str,
-    from_states: Tuple[str, ...],
+    from_states: tuple[str, ...],
     to_state: str,
     correlation_id: str = "",
 ) -> None:
@@ -549,10 +549,10 @@ def _transition(
 def _commit(
     mutation: Callable[[], None],
     event_type: str,
-    payload: Dict[str, Any],
+    payload: dict[str, Any],
     correlation_id: str = "",
     check: Optional[Callable[[], None]] = None,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Validate, record, then mutate - in that order.
 
     The audit link is written *before* the mutation so a failed audit write
