@@ -208,7 +208,7 @@ def _snapshot_for(
     item_id: Optional[str] = None,
     as_of: Optional[str] = None,
     **_ignored: Any,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Return a minimal, tool-scoped view of state for the sandbox.
 
     Only the record named by one of the ID keyword arguments is included,
@@ -238,15 +238,15 @@ def _snapshot_for(
     ``decisions.decide``; the closure below is already minimal for every
     current decider.
     """
-    vendors: Dict[str, Any] = {}
-    pos: Dict[str, Any] = {}
-    receipts: Dict[str, Any] = {}
-    invoices: Dict[str, Any] = {}
-    approvals: Dict[str, Any] = {}
-    requisitions: Dict[str, Any] = {}
-    rfqs: Dict[str, Any] = {}
-    quotes: Dict[str, Any] = {}
-    stock: Dict[str, Any] = {}
+    vendors: dict[str, Any] = {}
+    pos: dict[str, Any] = {}
+    receipts: dict[str, Any] = {}
+    invoices: dict[str, Any] = {}
+    approvals: dict[str, Any] = {}
+    requisitions: dict[str, Any] = {}
+    rfqs: dict[str, Any] = {}
+    quotes: dict[str, Any] = {}
+    stock: dict[str, Any] = {}
 
     with _LOCK:
 
@@ -391,13 +391,13 @@ def _as_float(value: Any) -> float:
     return 0.0
 
 
-def _receipts_for_invoice(invoice: Dict[str, Any]) -> List[Dict[str, Any]]:
+def _receipts_for_invoice(invoice: dict[str, Any]) -> list[dict[str, Any]]:
     """Return the receipt records linked to ``invoice``.
 
     Invoices may carry either a single ``receipt_id`` or a ``receipt_ids``
     list; both are honoured and de-duplicated. Caller must hold ``_LOCK``.
     """
-    receipts: List[Dict[str, Any]] = []
+    receipts: list[dict[str, Any]] = []
     seen = set()
 
     def add(rid: Any) -> None:
@@ -414,10 +414,10 @@ def _receipts_for_invoice(invoice: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 
 def _three_way_match(
-    invoice: Dict[str, Any],
-    po: Dict[str, Any],
-    receipts: List[Dict[str, Any]],
-) -> Tuple[bool, Dict[str, Any]]:
+    invoice: dict[str, Any],
+    po: dict[str, Any],
+    receipts: list[dict[str, Any]],
+) -> tuple[bool, dict[str, Any]]:
     """Compare invoice, PO and received amounts.
 
     A receipt carries an ``amount`` field: the value of the goods it records.
@@ -445,7 +445,7 @@ def _three_way_match(
 
 def _evaluate_three_way_match(
     invoice_id: str, po_id: str
-) -> Tuple[bool, Dict[str, Any]]:
+) -> tuple[bool, dict[str, Any]]:
     """Re-read live state and compute the match outcome.
 
     Raises ``ToolError`` if the invoice or PO is missing or inconsistent, so
@@ -533,8 +533,8 @@ def _check_create_approval(
 
 
 def _apply_transition(
-    proposal: Dict[str, Any], correlation_id: str
-) -> Dict[str, Any]:
+    proposal: dict[str, Any], correlation_id: str
+) -> dict[str, Any]:
     """Apply a ``transition`` proposal (three-way match).
 
     The proposal carries inputs only; the outcome is recomputed here from live
@@ -583,8 +583,8 @@ def _apply_transition(
 
 
 def _apply_create_approval(
-    proposal: Dict[str, Any], correlation_id: str
-) -> Dict[str, Any]:
+    proposal: dict[str, Any], correlation_id: str
+) -> dict[str, Any]:
     """Apply a ``create_approval`` proposal.
 
     Generates the approval ID and timestamp here (the only non-deterministic
@@ -648,8 +648,8 @@ def _apply_create_approval(
 
 
 def _apply_audit_note(
-    proposal: Dict[str, Any], correlation_id: str
-) -> Dict[str, Any]:
+    proposal: dict[str, Any], correlation_id: str
+) -> dict[str, Any]:
     """Apply an ``audit_note`` proposal.
 
     Delegates to ``log_audit_event`` with ``source="agent"`` so the reserved
@@ -692,8 +692,8 @@ def _check_create_requisition(vendor_id: Optional[str]) -> None:
 
 
 def _apply_create_requisition(
-    proposal: Dict[str, Any], correlation_id: str
-) -> Dict[str, Any]:
+    proposal: dict[str, Any], correlation_id: str
+) -> dict[str, Any]:
     """Apply a ``create_requisition`` proposal.
 
     Generates the requisition ID and timestamps here (the only
@@ -812,8 +812,8 @@ def _check_create_po(
 
 
 def _apply_create_po(
-    proposal: Dict[str, Any], correlation_id: str
-) -> Dict[str, Any]:
+    proposal: dict[str, Any], correlation_id: str
+) -> dict[str, Any]:
     """Apply a ``create_po`` proposal.
 
     Generates the PO ID and timestamps here. When a ``requisition_id`` is
@@ -935,8 +935,8 @@ def _check_record_receipt(po_id: str, amount: float) -> None:
 
 
 def _apply_record_receipt(
-    proposal: Dict[str, Any], correlation_id: str
-) -> Dict[str, Any]:
+    proposal: dict[str, Any], correlation_id: str
+) -> dict[str, Any]:
     """Apply a ``record_receipt`` proposal.
 
     Generates the receipt ID and timestamp here. The over-receipt check runs
@@ -983,8 +983,8 @@ def _apply_record_receipt(
 
 
 def _apply_po_status(
-    proposal: Dict[str, Any], correlation_id: str
-) -> Dict[str, Any]:
+    proposal: dict[str, Any], correlation_id: str
+) -> dict[str, Any]:
     """Apply a ``po_status`` proposal (close or cancel an OPEN PO).
 
     Only ``CLOSED`` and ``CANCELLED`` are accepted; the OPEN -> OPEN no-op is
@@ -1046,8 +1046,8 @@ def _check_requisition_status(requisition_id: str) -> None:
 
 
 def _apply_requisition_status(
-    proposal: Dict[str, Any], correlation_id: str
-) -> Dict[str, Any]:
+    proposal: dict[str, Any], correlation_id: str
+) -> dict[str, Any]:
     """Apply a ``requisition_status`` proposal (cancel an OPEN requisition).
 
     Only ``CANCELLED`` is accepted. The ``OPEN -> CONVERTED`` transition is
@@ -1101,7 +1101,7 @@ def _apply_requisition_status(
 # ---------------------------------------------------------------------------
 
 
-def lookup_vendor(vendor_id: str) -> Dict[str, Any]:
+def lookup_vendor(vendor_id: str) -> dict[str, Any]:
     """Return a vendor record, or ``VENDOR_NOT_FOUND``."""
     if not isinstance(vendor_id, str) or not vendor_id:
         return {
@@ -1116,7 +1116,7 @@ def lookup_vendor(vendor_id: str) -> Dict[str, Any]:
         return {"ok": True, "vendor": dict(vendor)}
 
 
-def get_invoice(invoice_id: str) -> Dict[str, Any]:
+def get_invoice(invoice_id: str) -> dict[str, Any]:
     """Return an invoice record, or ``INVOICE_NOT_FOUND``."""
     if not isinstance(invoice_id, str) or not invoice_id:
         return {
@@ -1131,7 +1131,7 @@ def get_invoice(invoice_id: str) -> Dict[str, Any]:
         return {"ok": True, "invoice": dict(invoice)}
 
 
-def get_invoice_aging(invoice_id: str, as_of: str = "") -> Dict[str, Any]:
+def get_invoice_aging(invoice_id: str, as_of: str = "") -> dict[str, Any]:
     """Return the AP aging bucket for an invoice.
 
     ``as_of`` is an optional ISO date; when omitted the current UTC date is
@@ -1198,7 +1198,7 @@ def get_invoice_aging(invoice_id: str, as_of: str = "") -> Dict[str, Any]:
     }
 
 
-def get_po(po_id: str) -> Dict[str, Any]:
+def get_po(po_id: str) -> dict[str, Any]:
     """Return a PO record, or ``PO_NOT_FOUND``.
 
     App-layer only: it is not in ``decisions.PROPOSAL_KINDS``, so the model
@@ -1218,7 +1218,7 @@ def get_po(po_id: str) -> Dict[str, Any]:
         return {"ok": True, "po": dict(po)}
 
 
-def get_requisition(requisition_id: str) -> Dict[str, Any]:
+def get_requisition(requisition_id: str) -> dict[str, Any]:
     """Return a requisition record, or ``REQUISITION_NOT_FOUND``.
 
     App-layer only, for the same reason as ``get_po``.
@@ -1242,7 +1242,7 @@ def get_requisition(requisition_id: str) -> Dict[str, Any]:
 
 def run_three_way_match(
     invoice_id: str, po_id: str, correlation_id: str = ""
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Compare PO, goods receipt and invoice; set MATCHED or EXCEPTION."""
     return _apply_transition(
         {"kind": "transition", "invoice_id": invoice_id, "po_id": po_id},
@@ -1256,7 +1256,7 @@ def request_payout_approval(
     po_id: str,
     invoice_id: str,
     correlation_id: str = "",
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Open a human approval gate. Does NOT move money."""
     return _apply_create_approval(
         {
@@ -1277,7 +1277,7 @@ def create_po(
     expected_delivery: str = "",
     requisition_id: str = "",
     correlation_id: str = "",
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Create a purchase order. App-layer only; never reachable by the model.
 
     A thin pass-through to ``_apply_create_po`` so the ID generation, the
@@ -1300,7 +1300,7 @@ def create_po(
 
 def record_goods_receipt(
     po_id: str, amount: Any, correlation_id: str = ""
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Record a goods receipt against an OPEN PO. App-layer only.
 
     The over-receipt control lives in ``_check_record_receipt`` and runs under
@@ -1312,7 +1312,7 @@ def record_goods_receipt(
     )
 
 
-def close_po(po_id: str, correlation_id: str = "") -> Dict[str, Any]:
+def close_po(po_id: str, correlation_id: str = "") -> dict[str, Any]:
     """Close an OPEN PO. App-layer only."""
     return _apply_po_status(
         {"kind": "po_status", "po_id": po_id, "to_status": PO_STATUS_CLOSED},
@@ -1320,7 +1320,7 @@ def close_po(po_id: str, correlation_id: str = "") -> Dict[str, Any]:
     )
 
 
-def cancel_po(po_id: str, correlation_id: str = "") -> Dict[str, Any]:
+def cancel_po(po_id: str, correlation_id: str = "") -> dict[str, Any]:
     """Cancel an OPEN PO. App-layer only."""
     return _apply_po_status(
         {"kind": "po_status", "po_id": po_id, "to_status": PO_STATUS_CANCELLED},
@@ -1330,10 +1330,10 @@ def cancel_po(po_id: str, correlation_id: str = "") -> Dict[str, Any]:
 
 def log_audit_event(
     event_type: str,
-    payload: Dict[str, Any],
+    payload: dict[str, Any],
     correlation_id: str = "",
     source: str = "agent",
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Append a note to the audit chain.
 
     ``source="tool"`` is the control plane's own bookkeeping and may use the
@@ -1380,7 +1380,7 @@ def ingest_invoice(
     amount: Any,
     currency: str = "USD",
     correlation_id: str = "",
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Record a new invoice. Raises ``ToolError`` if the audit write fails.
 
     The record is only inserted after the ``INVOICE_INGESTED`` audit link is
@@ -1452,7 +1452,7 @@ def ingest_invoice(
     return {"ok": True, "invoice": dict(record)}
 
 
-def get_approval(approval_id: str) -> Dict[str, Any]:
+def get_approval(approval_id: str) -> dict[str, Any]:
     """Return an approval record, or ``APPROVAL_NOT_FOUND``."""
     if not isinstance(approval_id, str) or not approval_id:
         return {
@@ -1473,7 +1473,7 @@ def get_approval(approval_id: str) -> Dict[str, Any]:
 
 def approve_payout(
     approval_id: str, approver: str, correlation_id: str = ""
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Record a human approval decision. Does NOT move money."""
     if not isinstance(approval_id, str) or not approval_id.strip():
         raise ToolError("INVALID_ARGUMENTS", {"field": "approval_id"})
@@ -1512,7 +1512,7 @@ def approve_payout(
 
 def _execute_payout(
     approval_id: str, executor: str, correlation_id: str = ""
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Settle an approved payout. Refuses when executor == approver."""
     if not isinstance(approval_id, str) or not approval_id.strip():
         raise ToolError("INVALID_ARGUMENTS", {"field": "approval_id"})
@@ -1557,7 +1557,7 @@ def _execute_payout(
         return {"ok": True, "approval": dict(_APPROVALS[approval_id])}
 
 
-def verify_audit_chain(from_file: bool = True) -> Dict[str, Any]:
+def verify_audit_chain(from_file: bool = True) -> dict[str, Any]:
     """Re-verify the hash chain.
 
     Reports an unreadable log in-band with ``ok: True`` and the raw error text
@@ -1615,7 +1615,7 @@ def verify_audit_chain(from_file: bool = True) -> Dict[str, Any]:
 # generate IDs/timestamps only in the apply step.
 
 
-def _check_create_rfq(vendor_ids: List[str]) -> None:
+def _check_create_rfq(vendor_ids: list[str]) -> None:
     """Validate an RFQ-creation request without changing anything.
 
     Every named vendor must exist, be ACTIVE and not be HIGH risk. Run under
@@ -1643,7 +1643,7 @@ def create_rfq(
     vendor_ids: Any,
     due_date: str = "",
     correlation_id: str = "",
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Open a request for quotes. App-layer only; never reachable by the model.
 
     Validates the arguments, then re-checks every vendor under ``_LOCK`` in
@@ -1671,7 +1671,7 @@ def create_rfq(
             "error": "MALFORMED_PROPOSAL",
             "detail": "vendor_ids",
         }
-    cleaned: List[str] = []
+    cleaned: list[str] = []
     for vid in vendor_ids:
         if not isinstance(vid, str) or not vid.strip():
             return {
@@ -1796,7 +1796,7 @@ def submit_quote(
     lead_time_days: Any,
     valid_until: str,
     correlation_id: str = "",
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Submit a vendor quote against an OPEN RFQ. App-layer only.
 
     The guards (RFQ OPEN, vendor on the RFQ, currency match, not expired, one
@@ -1910,7 +1910,7 @@ def submit_quote(
 
 def _apply_rfq_status(
     rfq_id: str, to_status: str, event_type: str, correlation_id: str
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Close or cancel an OPEN RFQ.
 
     Only ``CLOSED`` and ``CANCELLED`` are accepted. The check re-reads the RFQ
@@ -1948,21 +1948,21 @@ def _apply_rfq_status(
         return {"ok": True, "rfq": dict(_RFQS[rfq_id])}
 
 
-def close_rfq(rfq_id: str, correlation_id: str = "") -> Dict[str, Any]:
+def close_rfq(rfq_id: str, correlation_id: str = "") -> dict[str, Any]:
     """Close an OPEN RFQ so no further quotes are accepted. App-layer only."""
     return _apply_rfq_status(
         rfq_id, RFQ_STATUS_CLOSED, "RFQ_CLOSED", correlation_id
     )
 
 
-def cancel_rfq(rfq_id: str, correlation_id: str = "") -> Dict[str, Any]:
+def cancel_rfq(rfq_id: str, correlation_id: str = "") -> dict[str, Any]:
     """Cancel an OPEN RFQ. App-layer only."""
     return _apply_rfq_status(
         rfq_id, RFQ_STATUS_CANCELLED, "RFQ_CANCELLED", correlation_id
     )
 
 
-def get_rfq(rfq_id: str) -> Dict[str, Any]:
+def get_rfq(rfq_id: str) -> dict[str, Any]:
     """Return an RFQ record, or ``RFQ_NOT_FOUND``. App-layer only."""
     if not isinstance(rfq_id, str) or not rfq_id:
         return {
@@ -1977,7 +1977,7 @@ def get_rfq(rfq_id: str) -> Dict[str, Any]:
         return {"ok": True, "rfq": dict(rfq)}
 
 
-def get_quote(quote_id: str) -> Dict[str, Any]:
+def get_quote(quote_id: str) -> dict[str, Any]:
     """Return a quote record, or ``QUOTE_NOT_FOUND``. App-layer only."""
     if not isinstance(quote_id, str) or not quote_id:
         return {
@@ -1992,7 +1992,7 @@ def get_quote(quote_id: str) -> Dict[str, Any]:
         return {"ok": True, "quote": dict(quote)}
 
 
-def list_quotes(rfq_id: str) -> Dict[str, Any]:
+def list_quotes(rfq_id: str) -> dict[str, Any]:
     """Return every quote on an RFQ, ordered by ``quote_id``. App-layer only.
 
     Reports a missing RFQ in-band rather than returning an empty list, so a
@@ -2018,7 +2018,7 @@ def list_quotes(rfq_id: str) -> Dict[str, Any]:
 
 def award_quote(
     rfq_id: str, quote_id: str, correlation_id: str = ""
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Award an RFQ to one SUBMITTED quote and raise the resulting PO.
 
     App-layer only. The PO is created through the existing ``create_po`` path
