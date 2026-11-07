@@ -1,7 +1,7 @@
 """
 tool_modules/_codes.py
 ======================
-Data-only module: the Phase 0/1 error codes and status values.
+Data-only module: the Phase 0/1 and follow-up error codes and status values.
 
 These constants used to live in ``tools.py``. They are moved here so the
 control plane (``tools``), the HTTP surface (``app``) and the tests can share
@@ -62,6 +62,13 @@ PHASE0_ERROR_CODES = frozenset(
         REQUISITION_ALREADY_CONVERTED,
     }
 )
+
+
+# ---------------------------------------------------------------------------
+# Follow-up error codes
+# ---------------------------------------------------------------------------
+
+PO_NOT_LATE = "PO_NOT_LATE"
 
 
 # ---------------------------------------------------------------------------
