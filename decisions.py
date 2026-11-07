@@ -47,6 +47,37 @@ Every tool needs two entries:
   ``tools._snapshot_for``; everything else is business data, not a selector.
 
 The two tables are checked for key equality at import so they cannot drift.
+
+Phase 1 boundary: RFQs and quotes are operator-owned
+----------------------------------------------------
+``create_rfq`` / ``submit_quote`` / ``close_rfq`` / ``cancel_rfq`` /
+``award_quote`` and the read helpers ``get_rfq`` / ``get_quote`` /
+``list_quotes`` are deliberately **absent** from ``PROPOSAL_KINDS`` and
+``SNAPSHOT_SCOPES``. They are reachable only through ``app.py``'s
+operator-only endpoints, exactly like the existing PO boundary
+(``create_po`` is agent-facing, but ``close_po`` / ``cancel_po`` /
+``record_goods_receipt``'s siblings in ``app.py`` are not).
+
+Consequences, all intentional:
+
+* The model cannot name an RFQ or quote tool, so ``sandbox.dispatch`` rejects
+  it before any snapshot is built. There is no decider to write and no
+  proposal kind to validate.
+* ``SNAPSHOT_SCOPES`` is unchanged in this phase. Adding an RFQ tool would
+  require a new selector key (``rfq_id`` / ``quote_id``) and a matching
+  ``tools._snapshot_for`` branch; keeping the tables untouched is what makes
+  "operator-owned" true rather than aspirational.
+* ``award_quote`` raises its PO through the existing ``create_po`` path, so
+  the award inherits the ``PO_CREATED`` audit entry. The ``rfq_id`` linkage on
+  that PO must be stamped by ``award_quote``'s own mutation in ``tools.py`` -
+  **not** by widening ``create_po``'s proposal, which would force
+  ``SNAPSHOT_SCOPES["create_po"]`` to grow an ``rfq_id`` selector and break
+  the "unchanged in this phase" rule.
+
+``PHASE1_OPERATOR_ONLY_TOOLS`` names those tools so the boundary is testable
+and the import-time guard below fails loudly if one is ever added to either
+table. That guard is the point: a silent widening of the model's reach is
+exactly the failure this phase is meant to prevent.
 """
 
 from __future__ import annotations
@@ -65,6 +96,12 @@ AMOUNT_TOLERANCE = 0.01
 
 # Tool -> proposal kinds that tool may emit. ``sandbox._validate`` rejects any
 # envelope whose proposal kind is not listed here.
+#
+# Phase 1 RFQ/quote tools are deliberately absent; see the module docstring and
+# ``PHASE1_OPERATOR_ONLY_TOOLS`` below. Do not add them here without also
+# adding a decider, a ``SNAPSHOT_SCOPES`` entry and a ``tools._snapshot_for``
+# branch - and without deciding that the model should be able to source
+# procurement, which this phase explicitly does not.
 PROPOSAL_KINDS: Dict[str, Tuple[str, ...]] = {
     "lookup_vendor": ("read",),
     "get_invoice": ("read",),
@@ -84,6 +121,9 @@ PROPOSAL_KINDS: Dict[str, Tuple[str, ...]] = {
 # This is a dict, not a tuple: ``sandbox.dispatch`` only does
 # ``if tool not in decisions.SNAPSHOT_SCOPES``, and ``in`` on a dict tests
 # keys, so that call site is unchanged.
+#
+# Unchanged in Phase 1 on purpose: no ``rfq_id`` / ``quote_id`` selector exists
+# because no agent-facing tool reads one. See the module docstring.
 SNAPSHOT_SCOPES: Dict[str, Tuple[str, ...]] = {
     "lookup_vendor": ("vendor_id",),
     "get_invoice": ("invoice_id",),
@@ -95,6 +135,27 @@ SNAPSHOT_SCOPES: Dict[str, Tuple[str, ...]] = {
     "record_goods_receipt": ("po_id",),
 }
 
+# Phase 1 tools that are operator-owned and must never become agent-facing.
+#
+# They live in ``tools`` and are reachable only through ``app.py``'s
+# operator-only endpoints. Naming them here - rather than leaving their absence
+# from the tables implicit - makes the boundary explicit, testable, and
+# enforced by the guard below. ``award_quote`` is included even though it
+# delegates to the agent-facing ``create_po``: the *tool name* the model could
+# attempt is what matters, and that name must stay out of ``PROPOSAL_KINDS``.
+PHASE1_OPERATOR_ONLY_TOOLS = frozenset(
+    {
+        "create_rfq",
+        "get_rfq",
+        "submit_quote",
+        "get_quote",
+        "list_quotes",
+        "close_rfq",
+        "cancel_rfq",
+        "award_quote",
+    }
+)
+
 # Guard against drift: every tool in ``PROPOSAL_KINDS`` must declare its
 # selector keys here, and vice versa. A mismatch is a programming error, so
 # fail at import rather than at the first tool call.
@@ -103,6 +164,23 @@ if set(SNAPSHOT_SCOPES) != set(PROPOSAL_KINDS):
         "SNAPSHOT_SCOPES and PROPOSAL_KINDS disagree: "
         f"only in PROPOSAL_KINDS={sorted(set(PROPOSAL_KINDS) - set(SNAPSHOT_SCOPES))}, "
         f"only in SNAPSHOT_SCOPES={sorted(set(SNAPSHOT_SCOPES) - set(PROPOSAL_KINDS))}"
+    )
+
+# Guard the Phase 1 boundary. An RFQ/quote tool appearing in either table would
+# silently widen the model's reach - the exact failure this phase prevents - so
+# fail at import rather than at the first dispatch.
+_leaked_proposal_kinds = PHASE1_OPERATOR_ONLY_TOOLS & set(PROPOSAL_KINDS)
+if _leaked_proposal_kinds:
+    raise RuntimeError(
+        "Phase 1 RFQ/quote tools must stay operator-owned, but these are in "
+        f"PROPOSAL_KINDS: {sorted(_leaked_proposal_kinds)}"
+    )
+
+_leaked_snapshot_scopes = PHASE1_OPERATOR_ONLY_TOOLS & set(SNAPSHOT_SCOPES)
+if _leaked_snapshot_scopes:
+    raise RuntimeError(
+        "Phase 1 RFQ/quote tools must stay operator-owned, but these are in "
+        f"SNAPSHOT_SCOPES: {sorted(_leaked_snapshot_scopes)}"
     )
 
 
@@ -365,6 +443,11 @@ def _decide_create_po(
     ``tools._apply_create_po`` - so the sandbox and the control plane compare
     equal. ``expected_delivery`` is normalised to ISO here so the proposal is
     canonical; ``_apply_create_po`` normalises it again, which is a no-op.
+
+    ``rfq_id`` is deliberately not a field here. An award's RFQ linkage is
+    stamped by ``tools.award_quote``'s own mutation, not by widening this
+    proposal - doing the latter would require an ``rfq_id`` selector in
+    ``SNAPSHOT_SCOPES["create_po"]`` and break the Phase 1 "unchanged" rule.
     """
     vendor_id = arguments.get("vendor_id")
     amount = arguments.get("amount")
