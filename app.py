@@ -109,10 +109,20 @@ harmless beats quiet and corrupting.
 
 If ``AUDIT_LOG_PATH`` is empty the lock is skipped and the single-worker
 guarantee is not enforced; a warning is logged at boot.
+
+Follow-up scheduler
+-------------------
+When ``PL_FOLLOWUP_INTERVAL_S`` is positive, ``lifespan`` starts
+``_followup_loop`` as a background task and cancels it on shutdown. The pass
+runs in a worker thread (``asyncio.to_thread``) because ``run_followup`` does
+an fsync per flagged PO; running it on the event loop would block every
+request for the duration of the pass. The pass is idempotent, so a
+misconfigured multi-worker deployment that double-runs it is harmless.
 """
 
 from __future__ import annotations
 
+import asyncio
 import datetime
 import fcntl
 import hmac
@@ -136,6 +146,7 @@ import sandbox
 import tools
 
 from tool_modules import (
+    _followup,
     _tools_ap,
     _tools_audit,
     _tools_procurement,
@@ -145,6 +156,7 @@ from tool_modules import (
 from tool_modules._state import _RFQS
 
 from tool_modules._codes import (
+    PO_NOT_LATE,
     RFQ_NOT_FOUND,
     RFQ_NOT_OPEN,
     RFQ_EXISTS,
@@ -464,6 +476,26 @@ def _release_single_worker_lock(handle: Optional[Any]) -> None:
         handle.close()
 
 
+async def _followup_loop() -> None:
+    """Run the follow-up pass on a fixed interval.
+
+    ``asyncio.to_thread`` is required, not optional: ``run_followup`` does an
+    fsync per flagged PO, and calling it directly on the event loop would
+    block every request for the duration of the pass.
+
+    The interval is re-read each iteration so a runtime change to
+    ``config.PL_FOLLOWUP_INTERVAL_S`` takes effect on the next tick. The task
+    is only started when the value is ``> 0``, so the ``sleep(0)`` spin that a
+    zero value would cause is not reachable in normal operation.
+    """
+    while True:
+        await asyncio.sleep(config.PL_FOLLOWUP_INTERVAL_S)
+        try:
+            await asyncio.to_thread(_followup.run_followup)
+        except Exception:
+            _LOG.exception("follow-up pass failed")
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     """Refuse to serve if this host cannot sandbox, authenticate, or is a
@@ -471,13 +503,23 @@ async def lifespan(_app: FastAPI):
 
     The lock is taken first so a duplicate worker fails before it pays for the
     sandbox smoke test in ``sandbox.preflight``.
+
+    The follow-up scheduler is started only when ``PL_FOLLOWUP_INTERVAL_S`` is
+    positive, and is cancelled before the lock is released so a restart does
+    not race a still-running pass.
     """
     lock_handle = _acquire_single_worker_lock()
+    followup_task: Optional[asyncio.Task] = None
     try:
         sandbox.preflight()
         preflight_auth()
+        if config.PL_FOLLOWUP_INTERVAL_S > 0:
+            followup_task = asyncio.create_task(_followup_loop())
         yield
     finally:
+        if followup_task is not None:
+            followup_task.cancel()
+            await asyncio.gather(followup_task, return_exceptions=True)
         _release_single_worker_lock(lock_handle)
 
 
@@ -569,6 +611,8 @@ _TOOL_ERROR_STATUS = {
     QUOTE_NOT_SUBMITTED: 409,
     QUOTE_ALREADY_AWARDED: 409,
     REQUISITION_ALREADY_CONVERTED: 409,
+    # Follow-up: a PO that is not late is a conflict, not a missing record.
+    PO_NOT_LATE: 409,
 }
 
 # Status -> code for ``HTTPException`` raised by this module or by FastAPI.
@@ -640,6 +684,17 @@ class ReceiptRequest(BaseModel):
 class ActionRequest(BaseModel):
     """Body for a state-change endpoint that takes no business fields."""
 
+    correlation_id: str = ""
+
+
+class FollowupRequest(BaseModel):
+    """Body for ``POST /followup/run``.
+
+    ``as_of`` is an ISO date; an empty value means "today", matching
+    ``_followup._resolve_as_of``.
+    """
+
+    as_of: str = ""
     correlation_id: str = ""
 
 # ---------------------------------------------------------------------------
@@ -1064,7 +1119,7 @@ def run_agent(
             req.message, correlation_id=correlation_id, principal=principal
         )
     except RuntimeError as exc:
-        # Defensive: agent.run reports failures in-band, but a client-init
+        # Defensive: agent.run reports failures in-band, but a client init
         # failure must still surface as a 5xx rather than a silent 200.
         raise HTTPException(status_code=503, detail=str(exc))
 
@@ -1531,3 +1586,60 @@ def get_quote(
     principal: tools.Principal = Depends(require_operator),
 ) -> Any:
     return _respond(_tools_sourcing.get_quote(quote_id), cid)
+
+# ---------------------------------------------------------------------------
+# Follow-up endpoints: late POs and delay notification
+# ---------------------------------------------------------------------------
+#
+# Operator-only and app-layer only. None of these tools are in
+# ``decisions.PROPOSAL_KINDS``, so the model cannot reach them. The handler
+# names are chosen so they do not shadow the module functions they call.
+
+
+@app.get("/followup")
+def followup_index(
+    as_of: str = "",
+    cid: str = Depends(correlation_id_header),
+    principal: tools.Principal = Depends(require_operator),
+) -> Any:
+    """List every late PO as of ``as_of``. App-layer only.
+
+    ``as_of`` is a query parameter, not a body: this is a read, and an empty
+    value means "today" (see ``_followup._resolve_as_of``).
+    """
+    return _respond(_followup.list_late_pos(as_of), cid)
+
+
+@app.post("/followup/run")
+def run_followup_pass(
+    req: FollowupRequest,
+    cid: str = Depends(correlation_id_header),
+    principal: tools.Principal = Depends(require_operator),
+) -> Any:
+    """Flag every late, unflagged OPEN PO as of ``req.as_of``. Operator-only.
+
+    The handler is named ``run_followup_pass`` so it does not shadow
+    ``_followup.run_followup``.
+    """
+    correlation_id = _resolve_correlation_id(cid, req.correlation_id)
+    return _respond(_followup.run_followup(req.as_of), correlation_id)
+
+
+@app.post("/pos/{po_id}/notify-delay")
+def notify_delay(
+    po_id: str,
+    req: ActionRequest,
+    cid: str = Depends(correlation_id_header),
+    principal: tools.Principal = Depends(require_operator),
+) -> Any:
+    """Record that a late PO's delay has been notified. Operator-only.
+
+    The body is ``ActionRequest``, not ``FollowupRequest``: this endpoint takes
+    no ``as_of``. The notifier is the authenticated operator's ``sub``, not a
+    body field, so a caller cannot record a notification as someone else.
+    """
+    correlation_id = _resolve_correlation_id(cid, req.correlation_id)
+    return _respond(
+        _followup._apply_notify_delay(po_id, principal.sub, correlation_id),
+        correlation_id,
+    )
