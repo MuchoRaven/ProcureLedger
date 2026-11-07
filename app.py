@@ -147,6 +147,7 @@ import tools
 
 from tool_modules import (
     _followup,
+    _purchases,
     _tools_ap,
     _tools_audit,
     _tools_procurement,
@@ -1327,6 +1328,37 @@ def cancel_po(
         _tools_procurement.cancel_po(po_id, correlation_id=correlation_id),
         correlation_id,
     )
+
+# ---------------------------------------------------------------------------
+# Purchase monitoring: read-only derived views over the PO store
+# ---------------------------------------------------------------------------
+#
+# Operator-only and app-layer only. ``_purchases`` is not in
+# ``decisions.PROPOSAL_KINDS`` or ``decisions.SNAPSHOT_SCOPES``, so the model
+# cannot reach it, and it writes no audit events - a monitoring read must not
+# grow the chain. ``as_of`` is a query parameter, not a body: these are reads,
+# and an empty value means "today" (see ``_purchases._resolve_as_of``).
+
+
+@app.get("/purchases")
+def purchase_index(
+    as_of: str = "",
+    cid: str = Depends(correlation_id_header),
+    principal: tools.Principal = Depends(require_operator),
+) -> Any:
+    """List every PO with its derived purchase status. Operator-only."""
+    return _respond(_purchases.list_purchases(as_of), cid)
+
+
+@app.get("/purchases/{po_id}")
+def purchase_detail(
+    po_id: str,
+    as_of: str = "",
+    cid: str = Depends(correlation_id_header),
+    principal: tools.Principal = Depends(require_operator),
+) -> Any:
+    """Return one PO with its derived purchase status. Operator-only."""
+    return _respond(_purchases.purchase_status(po_id, as_of), cid)
 
 
 @app.get("/requisitions")
