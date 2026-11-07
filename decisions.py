@@ -78,13 +78,23 @@ Consequences, all intentional:
 and the import-time guard below fails loudly if one is ever added to either
 table. That guard is the point: a silent widening of the model's reach is
 exactly the failure this phase is meant to prevent.
+
+Vendor comparison
+-----------------
+``get_vendor_quotes`` and ``compare_vendors`` are agent-facing reads. Both are
+registered here, so ``agent.ALLOWED_TOOLS`` includes them and the model may
+call them. Their deciders reproduce ``tool_modules._tools_vendor_compare``
+exactly - same filtering, same rounding, same tie-break - because a read whose
+proposal differs from the live one is reported as ``stale``. The duplication
+is forced: ``decisions`` must stay importable inside the sandbox, where
+importing ``_tools_vendor_compare`` would pull in ``_state`` and the audit log.
 """
 
 from __future__ import annotations
 
 import math
 from datetime import date
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 CONTRACT_VERSION = "1.0.0"
 
@@ -111,6 +121,8 @@ PROPOSAL_KINDS: Dict[str, Tuple[str, ...]] = {
     "log_audit_event": ("audit_note",),
     "create_po": ("create_po",),
     "record_goods_receipt": ("record_receipt",),
+    "get_vendor_quotes": ("read",),
+    "compare_vendors": ("read",),
 }
 
 # Tool -> selector keys the tool reads from its arguments. ``sandbox._snapshot``
@@ -133,6 +145,12 @@ SNAPSHOT_SCOPES: Dict[str, Tuple[str, ...]] = {
     "log_audit_event": (),
     "create_po": ("vendor_id", "requisition_id"),
     "record_goods_receipt": ("po_id",),
+    # ``sku`` is the one selector that widens rather than narrows: a vendor
+    # comparison needs every quote for the SKU, not one. ``as_of`` is listed
+    # for ``compare_vendors`` because its expiry check reads it; the decider
+    # falls back to ``snapshot["as_of"]`` when the caller omits it.
+    "get_vendor_quotes": ("sku",),
+    "compare_vendors": ("sku", "as_of"),
 }
 
 # Phase 1 tools that are operator-owned and must never become agent-facing.
@@ -555,6 +573,366 @@ def _decide_record_goods_receipt(
     )
 
 
+# ---------------------------------------------------------------------------
+# Vendor-comparison deciders
+# ---------------------------------------------------------------------------
+#
+# These mirror ``tool_modules._tools_vendor_compare`` exactly. The duplication
+# is deliberate: ``decisions`` must stay importable inside the sandbox, where
+# importing ``_tools_vendor_compare`` would pull in ``_state`` and the audit
+# log. The two are kept in step by a test that asserts the decider's proposal
+# equals the tool's result for the same snapshot.
+#
+# Every detail matters, because ``sandbox._redeci`` compares a read's proposal
+# against the live re-decision and flags any difference as ``stale``:
+#
+# * candidates are sorted by ``quote_id`` before any arithmetic, so the float
+#   sums are order-independent;
+# * weights are normalised and rounded to ``_PRECISION`` before use, so the
+#   reported weights and the reported scores always agree;
+# * a criterion that is constant across the candidates normalises to 0.0 for
+#   all of them, so it cannot contribute a spurious difference;
+# * ties break on ``(score, unit_price, lead_time_days, vendor_id)``, so the
+#   order is total.
+
+_WEIGHT_KEYS: Tuple[str, ...] = ("price", "lead_time", "risk")
+
+_DEFAULT_WEIGHTS: Dict[str, float] = {
+    "price": 0.5,
+    "lead_time": 0.3,
+    "risk": 0.2,
+}
+
+_RISK_SCORE: Dict[str, float] = {
+    "LOW": 0.0,
+    "MEDIUM": 1.0,
+    "HIGH": 2.0,
+}
+
+_DEFAULT_RISK_SCORE = 1.0
+
+_PRECISION = 6
+
+
+def _risk_score(value: Any) -> float:
+    """Map a risk tier to its numeric score, defaulting to MEDIUM."""
+    if isinstance(value, str):
+        return _RISK_SCORE.get(value.strip().upper(), _DEFAULT_RISK_SCORE)
+    return _DEFAULT_RISK_SCORE
+
+
+def _normalise(values: list) -> list:
+    """Min-max normalise ``values`` to ``[0, 1]``, best (lowest) first.
+
+    A criterion that is identical across every candidate returns all zeros:
+    it cannot separate them, so it must not contribute a spurious difference.
+    """
+    if not values:
+        return []
+    low = min(values)
+    high = max(values)
+    if high - low <= 0:
+        return [0.0 for _ in values]
+    return [(value - low) / (high - low) for value in values]
+
+
+def _resolve_weights(weights: Any) -> Tuple[Optional[Dict[str, float]], str]:
+    """Resolve the caller's weights to a normalised, rounded dict.
+
+    Returns ``(weights, "")`` on success or ``(None, reason)`` on failure. The
+    weights are normalised to sum to 1 and rounded to ``_PRECISION`` places
+    *before* they are used, so the reported weights and the reported scores
+    always agree and the arithmetic is reproducible on both sides of the
+    sandbox boundary.
+    """
+    if weights is None:
+        raw = dict(_DEFAULT_WEIGHTS)
+    elif not isinstance(weights, dict):
+        return None, "weights must be an object"
+    else:
+        raw = {}
+        for key, value in weights.items():
+            if key not in _WEIGHT_KEYS:
+                return None, f"unknown weight {key!r}"
+            if not _is_number(value):
+                return None, f"weight {key!r} must be a number"
+            value = float(value)
+            if not math.isfinite(value):
+                return None, f"weight {key!r} must be finite"
+            if value < 0:
+                return None, f"weight {key!r} must be >= 0"
+            raw[key] = value
+        for key in _WEIGHT_KEYS:
+            raw.setdefault(key, 0.0)
+
+    total = sum(raw[key] for key in _WEIGHT_KEYS)
+    if total <= 0:
+        return None, "weights must not all be zero"
+    return {key: round(raw[key] / total, _PRECISION) for key in _WEIGHT_KEYS}, ""
+
+
+def _vendor_quote_row(
+    quote: Dict[str, Any], vendor: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Flatten one quote and its vendor into a report row."""
+    return {
+        "quote_id": quote.get("quote_id"),
+        "vendor_id": quote.get("vendor_id"),
+        "vendor_name": vendor.get("name", ""),
+        "vendor_status": vendor.get("status", ""),
+        "unit_price": _as_float(quote.get("unit_price")),
+        "currency": quote.get("currency") or vendor.get("currency", ""),
+        "lead_time_days": int(_as_float(quote.get("lead_time_days"))),
+        "moq": int(_as_float(quote.get("moq"))),
+        "valid_until": quote.get("valid_until") or "",
+        "payment_terms": (
+            quote.get("payment_terms") or vendor.get("payment_terms", "")
+        ),
+        "risk_tier": quote.get("risk_tier") or vendor.get("risk_tier", ""),
+        "status": quote.get("status", ""),
+    }
+
+
+def _vendor_quote_ineligibility(
+    quote: Dict[str, Any],
+    vendor: Dict[str, Any],
+    reference: date,
+) -> str:
+    """Return why ``quote`` cannot be ranked, or ``""`` if it can.
+
+    The order is deliberate: an orphaned quote is reported as such before its
+    own status is considered, because a missing vendor is the more fundamental
+    problem. A malformed ``valid_until`` is treated as "not expired" rather
+    than as a disqualification, mirroring ``_followup._is_late``: a bad date
+    field is a data gap, and dropping the candidate would hide it.
+    """
+    if not vendor:
+        return "VENDOR_NOT_FOUND"
+    if quote.get("status") != "ACTIVE":
+        return "QUOTE_INACTIVE"
+    if vendor.get("status") != "ACTIVE":
+        return "VENDOR_INACTIVE"
+
+    valid_until = quote.get("valid_until")
+    if isinstance(valid_until, str) and valid_until.strip():
+        try:
+            if date.fromisoformat(valid_until.strip()) < reference:
+                return "QUOTE_EXPIRED"
+        except ValueError:
+            pass
+
+    price = quote.get("unit_price")
+    if not _is_number(price):
+        return "INVALID_PRICE"
+    if not math.isfinite(float(price)) or float(price) <= 0:
+        return "INVALID_PRICE"
+    return ""
+
+
+def _vendor_quotes_for_sku(
+    snapshot: Dict[str, Any], sku: str
+) -> Tuple[list, Dict[str, Any]]:
+    """Return the SKU's quotes and the snapshot's vendor table.
+
+    The quotes are sorted by ``quote_id`` here, at the single point they are
+    read, so every caller iterates them in the same order and the float
+    arithmetic downstream is reproducible.
+    """
+    quotes = [
+        dict(quote)
+        for quote in snapshot.get("vendor_quotes", {}).values()
+        if quote.get("sku") == sku
+    ]
+    quotes.sort(key=lambda quote: quote.get("quote_id") or "")
+    return quotes, snapshot.get("vendors", {})
+
+
+def _decide_get_vendor_quotes(
+    arguments: Dict[str, Any], snapshot: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Return every vendor quote for ``sku``, ordered by ``quote_id``.
+
+    No filtering: inactive quotes and inactive vendors are included, each row
+    carrying its own ``status`` and the vendor's ``vendor_status``, so the
+    caller can see the whole picture. ``compare_vendors`` is the tool that
+    filters, and it reports what it dropped.
+
+    A SKU with no quotes at all is ``NO_QUOTES_FOR_SKU`` rather than an empty
+    list, so a typo is distinguishable from a SKU nobody has quoted yet.
+    """
+    sku = arguments.get("sku")
+    if not _nonempty_str(sku) or not sku.strip():
+        return _error("INVALID_ARGUMENTS", "sku must be a non-empty string")
+    sku = sku.strip()
+
+    quotes, vendors = _vendor_quotes_for_sku(snapshot, sku)
+    if not quotes:
+        return _error("NO_QUOTES_FOR_SKU", sku)
+
+    return _proposal(
+        {
+            "kind": "read",
+            "data": {
+                "sku": sku,
+                "quotes": [
+                    _vendor_quote_row(quote, vendors.get(quote.get("vendor_id"), {}))
+                    for quote in quotes
+                ],
+            },
+        }
+    )
+
+
+def _decide_compare_vendors(
+    arguments: Dict[str, Any], snapshot: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Rank the vendors that quoted ``sku`` on price, lead time and risk.
+
+    ``weights`` is an optional partial dict of criterion weights; see the
+    module docstring for the scoring. ``as_of`` is an optional ISO date used
+    for the expiry check; an empty value falls back to the date the control
+    plane froze into the snapshot, so the decider never reads the clock.
+
+    A SKU with no quotes at all is ``NO_QUOTES_FOR_SKU``. A SKU whose quotes
+    are all ineligible is ``ok: True`` with an empty ``ranking`` and a
+    populated ``excluded``: the SKU exists, so reporting it as missing would
+    be a lie, and the reasons are what the caller needs.
+    """
+    sku = arguments.get("sku")
+    if not _nonempty_str(sku) or not sku.strip():
+        return _error("INVALID_ARGUMENTS", "sku must be a non-empty string")
+    sku = sku.strip()
+
+    resolved, weights_error = _resolve_weights(arguments.get("weights"))
+    if resolved is None:
+        return _error("INVALID_WEIGHTS", weights_error)
+
+    as_of = arguments.get("as_of", "")
+    if as_of is None:
+        as_of = ""
+    if not isinstance(as_of, str):
+        return _error("INVALID_ARGUMENTS", "as_of must be a string")
+    reference = as_of.strip() or snapshot.get("as_of", "")
+    if not _nonempty_str(reference):
+        return _error("INVALID_SNAPSHOT", "snapshot is missing as_of")
+    try:
+        reference_date = date.fromisoformat(reference)
+    except ValueError:
+        return _error("INVALID_ARGUMENTS", f"as_of is not an ISO date: {reference}")
+
+    quotes, vendors = _vendor_quotes_for_sku(snapshot, sku)
+    if not quotes:
+        return _error("NO_QUOTES_FOR_SKU", sku)
+
+    eligible: list = []
+    excluded: list = []
+    for quote in quotes:
+        vendor = vendors.get(quote.get("vendor_id"), {})
+        reason = _vendor_quote_ineligibility(quote, vendor, reference_date)
+        if reason:
+            excluded.append(
+                {
+                    "quote_id": quote.get("quote_id"),
+                    "vendor_id": quote.get("vendor_id"),
+                    "reason": reason,
+                }
+            )
+        else:
+            eligible.append((quote, vendor))
+
+    if not eligible:
+        return _proposal(
+            {
+                "kind": "read",
+                "data": {
+                    "sku": sku,
+                    "as_of": reference_date.isoformat(),
+                    "weights": resolved,
+                    "ranking": [],
+                    "excluded": excluded,
+                },
+            }
+        )
+
+    # ``eligible`` is already in ``quote_id`` order, so these three lists are
+    # built in a fixed order and the normalisation below is reproducible.
+    prices = [_as_float(quote.get("unit_price")) for quote, _ in eligible]
+    leads = [
+        float(int(_as_float(quote.get("lead_time_days"))))
+        for quote, _ in eligible
+    ]
+    risks = [
+        _risk_score(quote.get("risk_tier") or vendor.get("risk_tier"))
+        for quote, vendor in eligible
+    ]
+
+    norm_price = _normalise(prices)
+    norm_lead = _normalise(leads)
+    norm_risk = _normalise(risks)
+
+    rows: list = []
+    for index, (quote, vendor) in enumerate(eligible):
+        components = {
+            "price": round(norm_price[index], _PRECISION),
+            "lead_time": round(norm_lead[index], _PRECISION),
+            "risk": round(norm_risk[index], _PRECISION),
+        }
+        score = round(
+            components["price"] * resolved["price"]
+            + components["lead_time"] * resolved["lead_time"]
+            + components["risk"] * resolved["risk"],
+            _PRECISION,
+        )
+        rows.append(
+            {
+                "quote_id": quote.get("quote_id"),
+                "vendor_id": quote.get("vendor_id"),
+                "vendor_name": vendor.get("name", ""),
+                "unit_price": _as_float(quote.get("unit_price")),
+                "currency": quote.get("currency") or vendor.get("currency", ""),
+                "lead_time_days": int(_as_float(quote.get("lead_time_days"))),
+                "moq": int(_as_float(quote.get("moq"))),
+                "risk_tier": (
+                    quote.get("risk_tier") or vendor.get("risk_tier", "")
+                ),
+                "payment_terms": (
+                    quote.get("payment_terms")
+                    or vendor.get("payment_terms", "")
+                ),
+                "score": score,
+                "components": components,
+            }
+        )
+
+    # Ties break on the raw criteria, then on ``vendor_id``, so the order is
+    # total and two runs over the same state cannot disagree.
+    rows.sort(
+        key=lambda row: (
+            row["score"],
+            row["unit_price"],
+            row["lead_time_days"],
+            row["vendor_id"] or "",
+        )
+    )
+
+    ranking = [
+        {"rank": rank, **row} for rank, row in enumerate(rows, start=1)
+    ]
+
+    return _proposal(
+        {
+            "kind": "read",
+            "data": {
+                "sku": sku,
+                "as_of": reference_date.isoformat(),
+                "weights": resolved,
+                "ranking": ranking,
+                "excluded": excluded,
+            },
+        }
+    )
+
+
 _DECIDERS = {
     "lookup_vendor": _decide_lookup_vendor,
     "get_invoice": _decide_get_invoice,
@@ -564,6 +942,8 @@ _DECIDERS = {
     "log_audit_event": _decide_log_audit_event,
     "create_po": _decide_create_po,
     "record_goods_receipt": _decide_record_goods_receipt,
+    "get_vendor_quotes": _decide_get_vendor_quotes,
+    "compare_vendors": _decide_compare_vendors,
 }
 
 
