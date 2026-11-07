@@ -224,9 +224,8 @@ def test_audit_write_failure_leaves_approval_state_unchanged(clean_state, monkey
 
 def test_create_po_emits_po_created(clean_state):
     """Creating a PO records a ``PO_CREATED`` link attributed to the tool."""
-    _call(
+    result = _call(
         tools.create_po,
-        "PO-9001",
         "VEND-001",
         500.00,
         "USD",
@@ -234,20 +233,20 @@ def test_create_po_emits_po_created(clean_state):
         None,
         "cid-po",
     )
-
-    assert "PO-9001" in tools._POS
+    assert result["ok"] is True
+    po_id = result["po"]["po_id"]
+    assert po_id in tools._POS
 
     events = _events("PO_CREATED")
     assert len(events) == 1
     assert events[0]["source"] == "tool"
-    assert events[0]["payload"]["po_id"] == "PO-9001"
+    assert events[0]["payload"]["po_id"] == po_id
 
 
 def test_create_po_converts_requisition(clean_state):
     """A PO raised against an open requisition converts it and links it back."""
     result = _call(
         tools.create_po,
-        "PO-9002",
         "VEND-001",
         800.00,
         "USD",
@@ -256,10 +255,11 @@ def test_create_po_converts_requisition(clean_state):
         "cid-req",
     )
     assert result["ok"] is True
+    po_id = result["po"]["po_id"]
 
     requisition = tools._REQUISITIONS["REQ-4002"]
     assert requisition["status"] == "CONVERTED"
-    assert requisition["po_id"] == "PO-9002"
+    assert requisition["po_id"] == po_id
 
 
 def test_record_receipt_emits_goods_receipt(clean_state):
