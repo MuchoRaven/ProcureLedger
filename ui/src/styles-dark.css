@@ -193,6 +193,156 @@
 }
 
 /* ------------------------------------------------------------------ */
+/* Three-column control-plane layout                                  */
+/* ------------------------------------------------------------------ */
+/*
+ * Column 1 is the shell sidebar (``.shell-dark``). This grid is columns 2
+ * and 3: the primary work surface and the right-hand card rail. The rail
+ * collapses under the main column below 1180px, where 340px of rail would
+ * squeeze the tables past readability.
+ */
+
+.ov-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 340px;
+  gap: 16px;
+  align-items: start;
+}
+
+.ov-main {
+  min-width: 0;
+}
+
+.ov-rail {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-width: 0;
+}
+
+.ov-card {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  width: 100%;
+  padding: 14px 16px;
+  border: 1px solid var(--ov-border);
+  border-radius: var(--radius-lg);
+  background: var(--ov-card);
+  color: var(--ov-text);
+  text-align: left;
+  font: inherit;
+}
+
+button.ov-card {
+  cursor: pointer;
+  transition: border-color 120ms ease, background 120ms ease;
+}
+
+button.ov-card:hover {
+  border-color: #475569;
+  background: #24334a;
+}
+
+.ov-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.ov-card-title {
+  font-size: 11.5px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--ov-muted);
+}
+
+.ov-metrics {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px 12px;
+}
+
+.ov-metric {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.ov-metric-label {
+  font-size: 11px;
+  color: var(--ov-muted);
+}
+
+.ov-metric-value {
+  font-size: 18px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.01em;
+  color: #f8fafc;
+}
+
+.ov-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.ov-list-item {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 12px;
+}
+
+.ov-list-item .mono {
+  font-size: 11.5px;
+}
+
+.ov-audit-list {
+  display: flex;
+  flex-direction: column;
+}
+
+.ov-audit-row {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  padding: 6px 0;
+  border-bottom: 1px solid #263449;
+}
+
+.ov-audit-row:last-child {
+  border-bottom: 0;
+  padding-bottom: 0;
+}
+
+.ov-audit-top {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.ov-audit-event {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: #e2e8f0;
+}
+
+.ov-audit-cid {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: #64748b;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ------------------------------------------------------------------ */
 /* Status pills                                                       */
 /* ------------------------------------------------------------------ */
 
@@ -299,6 +449,12 @@
 /* ------------------------------------------------------------------ */
 /* Narrow screens                                                     */
 /* ------------------------------------------------------------------ */
+
+@media (max-width: 1180px) {
+  .ov-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
 
 @media (max-width: 860px) {
   .shell-dark {
