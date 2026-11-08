@@ -186,13 +186,14 @@ export async function call<T>(
 /**
  * Work out which console a token belongs to.
  *
- * There is no "who am I" endpoint, so the role is inferred from three probes:
+ * There is no "who am I" endpoint, so the role is inferred from two probes:
  *
- * 1. ``GET /invoices`` is ``require_any``, so a 200 proves the token is real.
- *    A 401 here means the token is wrong and propagates.
- * 2. ``GET /purchases`` is ``require_operator`` and read-only - a 200 means
- *    operator, a 403 means not.
- * 3. ``POST /approvals/__probe__/execute`` is ``require_executor``. The
+ * 1. ``GET /purchases`` is ``require_operator`` and read-only - a 200 means
+ *    operator, a 403 means not, and a 401 means the token is wrong and
+ *    propagates. This probe doubles as the "is the token real" check: a bad
+ *    token is rejected by ``_authenticate`` before the role check, so it
+ *    surfaces as a 401 here rather than a 403.
+ * 2. ``POST /approvals/__probe__/execute`` is ``require_executor``. The
  *    approval does not exist, so ``_execute_payout`` raises
  *    ``APPROVAL_NOT_FOUND`` (404) for an executor and ``require_executor``
  *    raises ``AUTH_FORBIDDEN`` (403) otherwise. Nothing is mutated:
@@ -202,13 +203,11 @@ export async function call<T>(
  *
  * Anything left is the agent credential, which can only reach ``/agent/run``.
  *
- * The three probes cost three units of the caller's rate-limit budget
+ * The two probes cost two units of the caller's rate-limit budget
  * (``PL_RATE_LIMIT_PER_MIN``, default 120), which is why this runs once at
  * sign-in rather than on every render.
  */
 export async function probeRole(token: string): Promise<Role> {
-  await call('/invoices', token);
-
   try {
     await call('/purchases', token);
     return 'operator';

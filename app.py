@@ -25,6 +25,10 @@ interchangeable:
   procurement mutations (create PO, record receipt, close/cancel PO).
 * ``PL_EXECUTOR_TOKEN`` - role ``executor``. Payout settlement.
 
+Invoice reads (``GET /invoices`` and ``GET /invoices/{id}``) are
+operator-or-executor only: the agent credential is excluded so the model
+cannot read the invoice store directly, only through the sandbox snapshot.
+
 The split is the point: the human-approval gate is meaningless if the agent's
 own credential can reach ``/approvals/{id}/approve``, and separation of duties
 is meaningless if the approver's credential can also settle. Tokens are
@@ -424,6 +428,32 @@ def require_any(
 ) -> tools.Principal:
     """Allow any credential. Used for read-only endpoints."""
     return _authenticate(authorization)
+
+
+def require_operator_or_executor(
+    authorization: Optional[str] = Header(default=None, alias="Authorization"),
+) -> tools.Principal:
+    """Allow the operator or executor credential, but not the agent.
+
+    Used for invoice reads. The agent credential is deliberately excluded: the
+    model reaches invoice data through ``/agent/run`` and the sandbox snapshot,
+    never by reading the invoice store directly. The executor is included
+    because settlement needs to see the invoice it is settling.
+
+    A bad token is rejected by ``_authenticate`` with a 401 before the role
+    check, so this returns 403 only for a valid credential that lacks both
+    roles - which, with the three configured credentials, means the agent.
+    """
+    principal = _authenticate(authorization)
+    if not (
+        principal.has_role(ROLE_OPERATOR)
+        or principal.has_role(ROLE_EXECUTOR)
+    ):
+        raise AuthError(
+            "AUTH_FORBIDDEN",
+            "this endpoint requires the operator or executor credential",
+        )
+    return principal
 
 
 # ---------------------------------------------------------------------------
@@ -1206,9 +1236,9 @@ def verify_audit(
 @app.get("/invoices")
 def invoice_index(
     cid: str = Depends(correlation_id_header),
-    principal: tools.Principal = Depends(require_any),
+    principal: tools.Principal = Depends(require_operator_or_executor),
 ) -> Any:
-    """List every invoice. App-layer only; the model cannot reach this."""
+    """List every invoice. Operator/executor only; the model cannot reach this."""
     return _respond(list_invoices(), cid)
 
 
@@ -1216,7 +1246,7 @@ def invoice_index(
 def get_invoice(
     invoice_id: str,
     cid: str = Depends(correlation_id_header),
-    principal: tools.Principal = Depends(require_any),
+    principal: tools.Principal = Depends(require_operator_or_executor),
 ) -> Any:
     return _respond(_tools_ap.get_invoice(invoice_id), cid)
 
