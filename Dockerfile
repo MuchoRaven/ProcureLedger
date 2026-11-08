@@ -8,9 +8,10 @@ WORKDIR /ui
 #   COPY ui/package.json ui/package-lock.json ./
 #   RUN npm ci
 # for a faster, reproducible build.
+COPY ui/package.json ui/package-lock.json ./
+RUN npm ci
 COPY ui/ ./
-RUN npm install && npm run build
-
+RUN npm run build
 # ---------- stage 2: runtime ----------
 FROM python:3.11-slim-bookworm
 
