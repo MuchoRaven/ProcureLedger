@@ -119,6 +119,13 @@ _STDERR_SIGNATURES: Tuple[Tuple[Tuple[str, ...], str], ...] = (
     ),
     (
         (
+            # bwrap's own message when unshare(CLONE_NEWUSER) is refused.
+            # This is the most common failure on a container that is not
+            # privileged, and it contains none of the fragments below, so it
+            # needs its own entry. Without it the failure classifies as
+            # SANDBOX_VIOLATION and the operator-facing hint is lost.
+            "no permissions to create new namespace",
+            "non-privileged user namespaces",
             "operation not permitted",
             "can't mount",
             "unshare",
