@@ -646,6 +646,63 @@ button {
 }
 
 /* ------------------------------------------------------------------ */
+/* Filter bar                                                         */
+/* ------------------------------------------------------------------ */
+
+.filter-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 10px 14px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow);
+}
+
+.filter-bar input[type="search"],
+.filter-bar select {
+  padding: 6px 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+}
+
+.filter-bar input[type="search"] {
+  min-width: 220px;
+}
+
+.filter-bar input[type="search"]:focus,
+.filter-bar select:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: -1px;
+  border-color: var(--accent);
+}
+
+.filter-actions {
+  margin-left: auto;
+  display: flex;
+  gap: 8px;
+}
+
+/* Checkbox column and bold mono */
+.table th.check,
+.table td.check {
+  width: 36px;
+  text-align: center;
+  padding-left: 12px;
+  padding-right: 4px;
+}
+
+.mono.strong {
+  font-weight: 600;
+}
+
+/* ------------------------------------------------------------------ */
 /* Forms                                                              */
 /* ------------------------------------------------------------------ */
 
