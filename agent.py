@@ -12,7 +12,9 @@ allowlist below, and every allowlisted call is executed through
 reachable over HTTP, never by the model.
 
 ``ALLOWED_TOOLS`` is derived from ``decisions.PROPOSAL_KINDS`` so the agent
-allowlist and the sandbox's accepted-tool set cannot drift apart.
+allowlist and the sandbox's accepted-tool set cannot drift apart. The schemas
+offered to the model (``_TOOL_SCHEMAS``) are checked against that same set at
+import, so the model is never offered a tool it would be refused.
 
 Client configuration
 --------------------
@@ -42,7 +44,9 @@ The bracket writes go straight to ``tools.log_audit_event`` with
 ``source="tool"``, deliberately bypassing the sandbox: the control plane's own
 bookkeeping must not depend on the sandbox being healthy, or a broken sandbox
 would make the chain unwritable and the fail-closed check would abort every
-call before it was even attempted.
+call before it was even attempted. A sandboxed call that fails therefore still
+leaves ``TOOL_CALL_STARTED`` / ``TOOL_CALL_COMPLETED`` in the chain with
+``ok: false`` - the failure is recorded even though the tool never ran.
 
 Principal threading
 -------------------
@@ -96,6 +100,19 @@ _DISPATCH = {name: getattr(tools, name) for name in ALLOWED_TOOLS}
 # ---------------------------------------------------------------------------
 # Tool schemas exposed to the model
 # ---------------------------------------------------------------------------
+#
+# This list must be exactly ``ALLOWED_TOOLS`` - the guard below enforces it.
+# A schema with no dispatch entry is worse than a missing one: the model is
+# told the tool exists, reaches for it, and is refused with ``TOOL_NOT_ALLOWED``
+# mid-run. That reads as a sandbox failure in the transcript and burns a step.
+#
+# The procurement mutations (``get_po``, ``get_requisition``,
+# ``create_requisition``, ``close_po``, ``cancel_po``, ``cancel_requisition``)
+# are deliberately absent. They are app-layer only - reachable over HTTP with
+# the operator credential, never by the model - so they have no decider, no
+# ``SNAPSHOT_SCOPES`` entry and no place in this list. ``create_po`` and
+# ``record_goods_receipt`` are the two procurement writes the model *may* make,
+# and both are in ``PROPOSAL_KINDS``.
 
 _TOOL_SCHEMAS: List[Dict[str, Any]] = [
     {
@@ -251,50 +268,6 @@ _TOOL_SCHEMAS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "function": {
-            "name": "get_po",
-            "description": "Read a purchase order record by ID. Read-only.",
-            "parameters": {
-                "type": "object",
-                "properties": {"po_id": {"type": "string"}},
-                "required": ["po_id"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_requisition",
-            "description": "Read a requisition record by ID. Read-only.",
-            "parameters": {
-                "type": "object",
-                "properties": {"requisition_id": {"type": "string"}},
-                "required": ["requisition_id"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "create_requisition",
-            "description": (
-                "Raise a purchase requisition. Does NOT create a PO."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "description": {"type": "string"},
-                    "vendor_id": {"type": "string"},
-                    "quantity": {"type": "number"},
-                    "amount": {"type": "number"},
-                    "currency": {"type": "string"},
-                },
-                "required": ["description", "quantity", "amount"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
             "name": "create_po",
             "description": (
                 "Create a purchase order, optionally from an OPEN requisition."
@@ -330,43 +303,20 @@ _TOOL_SCHEMAS: List[Dict[str, Any]] = [
             },
         },
     },
-    {
-        "type": "function",
-        "function": {
-            "name": "close_po",
-            "description": "Close an OPEN purchase order.",
-            "parameters": {
-                "type": "object",
-                "properties": {"po_id": {"type": "string"}},
-                "required": ["po_id"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "cancel_po",
-            "description": "Cancel an OPEN purchase order.",
-            "parameters": {
-                "type": "object",
-                "properties": {"po_id": {"type": "string"}},
-                "required": ["po_id"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "cancel_requisition",
-            "description": "Cancel an OPEN requisition.",
-            "parameters": {
-                "type": "object",
-                "properties": {"requisition_id": {"type": "string"}},
-                "required": ["requisition_id"],
-            },
-        },
-    },
 ]
+
+# Guard against drift: the model must be offered exactly the tools it is
+# allowed to call. A schema with no dispatch entry produces
+# ``TOOL_NOT_ALLOWED`` mid-run, which is indistinguishable from a sandbox
+# failure in the transcript; a dispatch entry with no schema is a tool the
+# model can never discover. Both are programming errors, so fail at import.
+_SCHEMA_NAMES = {schema["function"]["name"] for schema in _TOOL_SCHEMAS}
+if _SCHEMA_NAMES != ALLOWED_TOOLS:
+    raise RuntimeError(
+        "tool schemas and ALLOWED_TOOLS disagree: "
+        f"offered but not callable={sorted(_SCHEMA_NAMES - ALLOWED_TOOLS)}, "
+        f"callable but not offered={sorted(ALLOWED_TOOLS - _SCHEMA_NAMES)}"
+    )
 
 SYSTEM_PROMPT = (
     "You are ProcureLedger, an accounts-payable assistant. "

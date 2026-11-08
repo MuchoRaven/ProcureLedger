@@ -22,9 +22,9 @@ Containment properties
 * No network: ``bwrap --unshare-all`` includes ``--unshare-net``.
 * No secrets: ``--clearenv`` then a minimal ``--setenv`` allowlist. The
    request envelope carries business data only.
-* Read-only root: ``--ro-bind`` for ``/usr``, ``/lib``, ``/lib64``, and the
-   app directory. The only writable paths are ``/tmp`` and ``/workspace``,
-   both tmpfs.
+* Read-only root: ``--ro-bind`` for ``/usr``, ``/usr/local``, ``/lib``,
+   ``/lib64``, and the app directory. The only writable paths are ``/tmp`` and
+   ``/workspace``, both tmpfs.
 * Resource caps: ``prlimit --as`` for address space, ``--nofile`` and
    ``--nproc`` for file and process counts, ``--core=0`` to suppress dumps.
    Wall clock is enforced by ``subprocess.run(timeout=...)``.
@@ -179,7 +179,16 @@ def _bwrap_command() -> list:
         "--setenv", "PL_WORKSPACE", "/workspace",
         "--setenv", "PL_SANDBOX_PROFILE", "default",
     ]
-    for path in ("/usr", "/lib", "/lib64"):
+    # ``/usr/local`` is load-bearing, not cosmetic. The runtime image is
+    # ``python:3.11-slim-bookworm``, which installs the interpreter at
+    # ``/usr/local/bin/python3``; the Dockerfile adds
+    # ``/usr/bin/python3 -> /usr/local/bin/python3`` so the ``PATH`` above can
+    # find it. Binding ``/usr`` alone leaves that symlink dangling inside the
+    # sandbox, ``execvp`` fails with ENOENT, and bwrap's ``die()`` exits 1 -
+    # which surfaces as ``SANDBOX_VIOLATION`` with ``detail: "exit 1"`` on
+    # every single tool call. The stderr line to look for in the server log is
+    # ``bwrap: execvp python3: No such file or directory``.
+    for path in ("/usr", "/usr/local", "/lib", "/lib64"):
         if os.path.exists(path):
             cmd.extend(["--ro-bind", path, path])
     cmd.extend([
