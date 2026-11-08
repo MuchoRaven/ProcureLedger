@@ -102,7 +102,14 @@ function Root() {
   const label = nav.find((item) => item.id === activeId)?.label ?? activeId;
 
   return (
-    <Layout nav={nav} active={activeId} onNavigate={setActive}>
+    <Layout
+      nav={nav}
+      active={activeId}
+      onNavigate={setActive}
+      // The dark control-plane chrome is scoped to Overview; every other view
+      // keeps the original light shell.
+      variant={activeId === 'overview' ? 'dark' : 'default'}
+    >
       <View id={activeId} label={label} onNavigate={setActive} />
     </Layout>
   );

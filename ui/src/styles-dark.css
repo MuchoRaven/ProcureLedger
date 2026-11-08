@@ -1,0 +1,321 @@
+/*
+ * Dark control-plane theme.
+ *
+ * Scoped to the Overview view. Every rule below is either prefixed with
+ * ``ov-`` or nested under ``.shell-dark`` / ``.ov-root``, so no other view
+ * changes appearance. Imported after ``styles.css`` so these overrides win on
+ * equal specificity.
+ *
+ * Palette: slate-950 canvas (#0F172A), slate-800 cards (#1E293B), slate-700
+ * borders (#334155), sky-400 accent (#38BDF8), emerald-400 success
+ * (#34D399), amber-400 warning (#FBBF24).
+ */
+
+/* ------------------------------------------------------------------ */
+/* Shell                                                              */
+/* ------------------------------------------------------------------ */
+
+.shell-dark {
+  --sidebar-w: 256px;
+  grid-template-columns: var(--sidebar-w) 1fr;
+  background: #0f172a;
+}
+
+.sidebar-dark {
+  width: var(--sidebar-w);
+  background: #0b1220;
+  border-right: 1px solid #1e293b;
+}
+
+.sidebar-dark .brand-name {
+  color: #f8fafc;
+}
+
+.sidebar-dark .nav-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: #94a3b8;
+}
+
+.sidebar-dark .nav-item:hover:not(:disabled) {
+  background: rgba(148, 163, 184, 0.08);
+  color: #e2e8f0;
+}
+
+.sidebar-dark .nav-item-active {
+  background: rgba(14, 165, 233, 0.1);
+  color: #38bdf8;
+  box-shadow: inset 2px 0 0 #38bdf8;
+}
+
+.sidebar-dark .nav-icon {
+  flex: 0 0 auto;
+  opacity: 0.9;
+}
+
+.sidebar-dark .sidebar-foot {
+  border-top-color: rgba(148, 163, 184, 0.15);
+}
+
+.sidebar-dark .sidebar-foot .btn-ghost {
+  border-color: #334155;
+  color: #cbd5e1;
+}
+
+.sidebar-dark .sidebar-foot .btn-ghost:hover:not(:disabled) {
+  background: rgba(148, 163, 184, 0.1);
+}
+
+.main-dark {
+  background: #0f172a;
+}
+
+.topbar-dark {
+  background: #0f172a;
+  border-bottom: 1px solid #1e293b;
+}
+
+.topbar-dark h1 {
+  color: #f8fafc;
+}
+
+.content-dark {
+  background: #0f172a;
+  /* Room for the fixed status footer. */
+  padding-bottom: 76px;
+}
+
+/* ------------------------------------------------------------------ */
+/* Overview surface                                                   */
+/* ------------------------------------------------------------------ */
+
+.ov-root {
+  --ov-card: #1e293b;
+  --ov-border: #334155;
+  --ov-text: #e2e8f0;
+  --ov-muted: #94a3b8;
+  color: var(--ov-text);
+}
+
+.ov-root .muted {
+  color: var(--ov-muted);
+}
+
+.ov-root .empty {
+  color: var(--ov-muted);
+}
+
+.ov-root .btn-ghost {
+  background: transparent;
+  border-color: var(--ov-border);
+  color: var(--ov-text);
+}
+
+.ov-root .btn-ghost:hover:not(:disabled) {
+  background: #24334a;
+}
+
+/* Cards ------------------------------------------------------------ */
+
+.ov-root .card {
+  background: var(--ov-card);
+  border: 1px solid var(--ov-border);
+  box-shadow: none;
+  color: var(--ov-text);
+}
+
+.ov-root .card-link:hover {
+  border-color: #475569;
+  background: #24334a;
+  box-shadow: 0 10px 28px rgba(2, 6, 23, 0.55);
+}
+
+.ov-root .card-label {
+  color: var(--ov-muted);
+}
+
+.ov-root .card-value {
+  color: #f8fafc;
+}
+
+.ov-root .card-foot {
+  color: var(--ov-muted);
+}
+
+.ov-value-ok {
+  color: #34d399;
+}
+
+.ov-value-danger {
+  color: #f87171;
+}
+
+/* Panels ----------------------------------------------------------- */
+
+.ov-root .panel {
+  background: var(--ov-card);
+  border: 1px solid var(--ov-border);
+  box-shadow: none;
+}
+
+.ov-root .panel-head {
+  background: var(--ov-card);
+  border-bottom: 1px solid var(--ov-border);
+}
+
+.ov-root .panel-head h2 {
+  color: #f8fafc;
+}
+
+/* Tables ----------------------------------------------------------- */
+
+.ov-root .table {
+  color: var(--ov-text);
+}
+
+.ov-root .table thead th {
+  background: #172033;
+  border-bottom: 1px solid var(--ov-border);
+  color: var(--ov-muted);
+}
+
+.ov-root .table tbody td {
+  border-bottom: 1px solid #263449;
+}
+
+.ov-root .table tbody tr:hover {
+  background: #24334a;
+}
+
+.ov-root .table tbody tr:last-child td {
+  border-bottom: 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* Status pills                                                       */
+/* ------------------------------------------------------------------ */
+
+.ov-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 9px;
+  border-radius: 999px;
+  border: 1px solid transparent;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+}
+
+.ov-chip-ok {
+  background: rgba(16, 185, 129, 0.12);
+  border-color: rgba(16, 185, 129, 0.35);
+  color: #34d399;
+}
+
+.ov-chip-warn {
+  background: rgba(245, 158, 11, 0.12);
+  border-color: rgba(245, 158, 11, 0.35);
+  color: #fbbf24;
+}
+
+.ov-chip-danger {
+  background: rgba(239, 68, 68, 0.12);
+  border-color: rgba(239, 68, 68, 0.35);
+  color: #f87171;
+}
+
+.ov-chip-accent {
+  background: rgba(14, 165, 233, 0.12);
+  border-color: rgba(14, 165, 233, 0.35);
+  color: #38bdf8;
+}
+
+.ov-chip-muted {
+  background: rgba(148, 163, 184, 0.1);
+  border-color: rgba(148, 163, 184, 0.3);
+  color: #94a3b8;
+}
+
+/* ------------------------------------------------------------------ */
+/* Fixed status footer                                                */
+/* ------------------------------------------------------------------ */
+
+.ov-footer {
+  position: fixed;
+  left: var(--sidebar-w, 232px);
+  right: 0;
+  bottom: 0;
+  z-index: 30;
+  display: flex;
+  align-items: center;
+  gap: 20px;
+  flex-wrap: wrap;
+  padding: 9px 24px;
+  background: #0b1220;
+  border-top: 1px solid #1e293b;
+  color: #94a3b8;
+  font-size: 12px;
+}
+
+.ov-footer-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  white-space: nowrap;
+}
+
+.ov-footer-cid {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: #cbd5e1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.ov-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 999px;
+  background: #64748b;
+}
+
+.ov-dot-ok {
+  background: #34d399;
+  box-shadow: 0 0 0 3px rgba(52, 211, 153, 0.15);
+}
+
+.ov-dot-danger {
+  background: #f87171;
+  box-shadow: 0 0 0 3px rgba(248, 113, 113, 0.15);
+}
+
+.ov-dot-muted {
+  background: #64748b;
+}
+
+/* ------------------------------------------------------------------ */
+/* Narrow screens                                                     */
+/* ------------------------------------------------------------------ */
+
+@media (max-width: 860px) {
+  .shell-dark {
+    grid-template-columns: 1fr;
+  }
+
+  .sidebar-dark {
+    width: auto;
+    border-right: 0;
+    border-bottom: 1px solid #1e293b;
+  }
+
+  .ov-footer {
+    left: 0;
+  }
+
+  .content-dark {
+    padding-bottom: 104px;
+  }
+}
