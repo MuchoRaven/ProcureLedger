@@ -8,10 +8,15 @@ import { ErrorBanner } from '../components/Feedback';
 /**
  * The agent console.
  *
+ * The agent is a restricted service account, not a chat assistant, and the UI
+ * is built to say so. The constraints that make it safe - independent runs,
+ * no memory, no authority to move money, every call sandboxed and audited -
+ * are on screen rather than in a tooltip, because a friendly chat UI invites
+ * casual use of a system that should be used deliberately.
+ *
  * One run per message, not a conversation. ``agent.run_agent_cycle`` builds a
  * fresh ``[system, user]`` message list on every call, so the agent has no
- * memory of an earlier turn - the log below is a record of independent runs,
- * and the toolbar says so rather than letting the transcript imply otherwise.
+ * memory of an earlier turn - the log below is a record of independent runs.
  *
  * The agent cannot move money. ``/agent/run`` is the only endpoint the agent
  * credential can reach; approval and settlement are separate credentials, and
@@ -53,6 +58,15 @@ const SUGGESTIONS = [
 ];
 
 /**
+ * The hard ceiling on loop iterations, from ``agent._HARD_MAX_STEPS``.
+ *
+ * The deployment may configure a lower cap via ``AGENT_MAX_STEPS``; this is
+ * the absolute maximum, so "N of 8" is always true even when the run stopped
+ * earlier at a lower configured cap.
+ */
+const STEP_CAP = 8;
+
+/**
  * Recover a completed run from the error ``call()`` threw.
  *
  * Only ``MAX_STEPS_EXCEEDED`` qualifies. A 503 also carries a ``transcript``
@@ -77,15 +91,84 @@ function toolError(result: Record<string, unknown> | null | undefined): string {
 }
 
 /**
- * The closing audit link failed after the tool already ran.
+ * A read whose live data diverged from the sandbox snapshot.
  *
- * ``agent.dispatch_tool`` keeps the result and attaches ``audit_error`` rather
- * than discarding it, so the call happened but the chain has a gap. That is
- * worth a chip of its own - it is neither a success nor a tool failure.
+ * ``sandbox._redeci`` sets ``stale: true`` when a read's proposal differs from
+ * the live re-decision. The answer is still applied, but it may be out of
+ * date, and that is worth showing rather than dropping.
  */
-function auditGap(result: Record<string, unknown> | null | undefined): string {
-  const gap = result?.audit_error;
-  return typeof gap === 'string' ? gap : '';
+function isStale(result: Record<string, unknown> | null | undefined): boolean {
+  return result?.stale === true;
+}
+
+/**
+ * The audit state of one tool call.
+ *
+ * ``agent.dispatch_tool`` brackets every call with ``TOOL_CALL_STARTED`` and
+ * ``TOOL_CALL_COMPLETED``. Three outcomes are possible:
+ *
+ * * ``logged``  - both brackets were written.
+ * * ``gap``     - the call ran but the closing bracket failed; the result
+ *                 carries ``audit_error``.
+ * * ``aborted`` - the opening bracket failed, so the call was refused before
+ *                 it ran; the result is ``AUDIT_WRITE_FAILED``.
+ */
+type AuditState = 'logged' | 'gap' | 'aborted';
+
+function auditState(
+  result: Record<string, unknown> | null | undefined,
+): AuditState {
+  if (result?.error === 'AUDIT_WRITE_FAILED') return 'aborted';
+  if (typeof result?.audit_error === 'string') return 'gap';
+  return 'logged';
+}
+
+type ChipTone = 'ok' | 'error' | 'warn';
+
+/**
+ * The chip for one tool call: its tone, its label, and an optional tooltip.
+ *
+ * The label carries both the result and the audit state, so the chain status
+ * is visible rather than assumed. Priority: aborted > gap > stale > result.
+ */
+function chipFor(entry: AgentTranscriptEntry): {
+  tone: ChipTone;
+  label: string;
+  title?: string;
+} {
+  const state = auditState(entry.result);
+  const ok = toolOk(entry.result);
+  const err = toolError(entry.result);
+  const stale = isStale(entry.result);
+  const resultLabel = ok ? 'ok' : err || 'error';
+
+  if (state === 'aborted') {
+    return {
+      tone: 'error',
+      label: 'not logged',
+      title:
+        'The opening audit link failed, so the call was refused before it ran.',
+    };
+  }
+  if (state === 'gap') {
+    return {
+      tone: 'warn',
+      label: `${resultLabel} · audit gap`,
+      title: 'The call ran but the closing audit link failed.',
+    };
+  }
+  if (stale) {
+    return {
+      tone: 'warn',
+      label: `${resultLabel} · stale`,
+      title:
+        'Live data diverged from the sandbox snapshot; the answer may be out of date.',
+    };
+  }
+  return {
+    tone: ok ? 'ok' : 'error',
+    label: `${resultLabel} · logged`,
+  };
 }
 
 export function AgentConsole() {
@@ -159,11 +242,15 @@ export function AgentConsole() {
 
   return (
     <div className="chat">
+      <div className="banner banner-info">
+        <strong>Restricted service account.</strong> Independent runs, no
+        memory between messages. Cannot approve, settle, or ingest invoices.
+        Every tool call runs in a sandbox and is bracketed in the audit chain.
+      </div>
+
       <div className="toolbar">
         <span className="muted small">
-          Each run is independent: the agent starts from its system prompt and
-          this message, with no memory of an earlier turn. It cannot move money
-          - approval and settlement are separate credentials.
+          {running ? 'A run is in progress.' : 'Ready.'}
         </span>
         <button
           type="button"
@@ -171,19 +258,27 @@ export function AgentConsole() {
           disabled={running || turns.length === 0}
           onClick={clear}
         >
-          Clear
+          Clear log
         </button>
       </div>
 
       {turns.length === 0 ? (
         <div className="chat-empty">
-          <div className="chat-empty-avatar">PL</div>
-          <div className="chat-empty-title">Ask ProcureLedger</div>
+          <div className="chat-empty-title">ProcureLedger agent</div>
           <div className="chat-empty-sub">
-            Inspect vendors, run three-way matches, or open a payout approval.
-            The agent cannot move money - settlement is a separate executor
-            action.
+            A restricted service account for accounts-payable work. It can
+            read vendors, invoices, POs and requisitions; run three-way
+            matches; compare vendors; create POs and record receipts; and
+            request a payout approval. It cannot approve, settle, or ingest
+            invoices — those are separate credentials.
           </div>
+          <div className="chat-empty-sub">
+            Each message is an independent run: the agent starts from its
+            system prompt and this message, with no memory of an earlier turn.
+            Every tool call runs in a sandbox and is bracketed in the audit
+            chain.
+          </div>
+          <div className="chat-empty-label">Example calls</div>
           <div className="chat-suggestions">
             {SUGGESTIONS.map((s) => (
               <button
@@ -214,32 +309,18 @@ export function AgentConsole() {
           value={draft}
           onChange={(event) => setDraft(event.target.value)}
           onKeyDown={onKeyDown}
-          placeholder="Ask the agent to inspect a vendor, run a three-way match, or open a payout approval…"
+          placeholder="Describe the call to make. Each message is a fresh run."
           rows={2}
           spellCheck={false}
         />
         <div className="composer-actions">
-          <span className="composer-hint">Ctrl/⌘ + Enter to send</span>
+          <span className="composer-hint">Ctrl/⌘ + Enter to run</span>
           <button
             type="submit"
-            className="composer-send"
+            className="btn btn-sm btn-primary"
             disabled={running || !draft.trim()}
-            aria-label="Send"
           >
-            <svg
-              width="16"
-              height="16"
-              viewBox="0 0 16 16"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="1.8"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-              aria-hidden="true"
-            >
-              <path d="M2.5 8h11" />
-              <path d="m9 3.5 4.5 4.5L9 12.5" />
-            </svg>
+            {running ? 'Running…' : 'Run'}
           </button>
         </div>
       </form>
@@ -286,48 +367,20 @@ function TurnCard({
 }) {
   return (
     <div className="turn">
-      <div className="bubble bubble-user">
-        <div className="bubble-avatar bubble-avatar-user" aria-hidden="true">
-          <svg
-            width="14"
-            height="14"
-            viewBox="0 0 16 16"
-            fill="none"
-            stroke="currentColor"
-            strokeWidth="1.6"
-            strokeLinecap="round"
-            strokeLinejoin="round"
-          >
-            <circle cx="8" cy="5.5" r="2.5" />
-            <path d="M3 13.5c0-2.5 2.2-4 5-4s5 1.5 5 4" />
-          </svg>
-        </div>
-        <div className="bubble-content">
-          <div className="bubble-role">You</div>
-          <div className="bubble-body">{turn.message}</div>
-        </div>
+      <div className="turn-block turn-user">
+        <div className="turn-role">You</div>
+        <div className="turn-reply">{turn.message}</div>
       </div>
 
-      <div className="bubble bubble-agent">
-        <div className="bubble-avatar bubble-avatar-agent" aria-hidden="true">
-          PL
-        </div>
-        <div className="bubble-content">
-          <div className="bubble-role">Agent</div>
-          {turn.pending ? (
-            <div className="bubble-body muted">
-              <span className="typing">
-                <span />
-                <span />
-                <span />
-              </span>
-            </div>
-          ) : turn.error ? (
-            <ErrorBanner error={turn.error} />
-          ) : turn.result ? (
-            <RunResult result={turn.result} onSelect={onSelect} />
-          ) : null}
-        </div>
+      <div className="turn-block turn-agent">
+        <div className="turn-role">Agent</div>
+        {turn.pending ? (
+          <div className="turn-pending">Running…</div>
+        ) : turn.error ? (
+          <ErrorBanner error={turn.error} />
+        ) : turn.result ? (
+          <RunResult result={turn.result} onSelect={onSelect} />
+        ) : null}
       </div>
     </div>
   );
@@ -341,11 +394,14 @@ function RunResult({
   onSelect: (entry: AgentTranscriptEntry, step: number) => void;
 }) {
   const calls = result.transcript.length;
+  const staleCount = result.transcript.filter((entry) =>
+    isStale(entry.result),
+  ).length;
 
   return (
     <div className="stack">
       {result.ok ? (
-        <div className="bubble-body">
+        <div className="turn-reply">
           {result.reply ? (
             result.reply
           ) : (
@@ -362,46 +418,51 @@ function RunResult({
               ? `The run hit the ${result.steps}-step cap without a final answer. The transcript below is what it did.`
               : result.detail || 'The run did not complete.'}
           </div>
-          {result.correlation_id ? (
-            <div className="banner-cid">
-              correlation_id: {result.correlation_id}
-            </div>
-          ) : null}
         </div>
       )}
 
       <div className="run-meta">
-        <span>
-          {result.steps} step{result.steps === 1 ? '' : 's'}
+        <span
+          title={`The loop is capped at ${STEP_CAP} steps (the hard ceiling; the deployment may configure a lower cap).`}
+        >
+          {result.steps} of {STEP_CAP} steps
         </span>
         <span className="run-meta-dot" />
         <span>
           {calls} tool call{calls === 1 ? '' : 's'}
         </span>
+        {staleCount > 0 ? (
+          <>
+            <span className="run-meta-dot" />
+            <span className="run-meta-warn">{staleCount} stale</span>
+          </>
+        ) : null}
       </div>
 
       {calls > 0 ? (
         <div className="tool-chips">
           {result.transcript.map((entry, index) => {
-            const gap = auditGap(entry.result);
-            const ok = toolOk(entry.result);
-            const err = toolError(entry.result);
-            const tone = gap ? 'warn' : ok ? 'ok' : 'error';
-            const label = gap ? 'audit gap' : ok ? 'ok' : err || 'error';
+            const chip = chipFor(entry);
             return (
               <button
                 key={index}
                 type="button"
-                className={`tool-chip tool-chip-${tone}`}
+                className={`tool-chip tool-chip-${chip.tone}`}
                 onClick={() => onSelect(entry, index + 1)}
-                title={gap || err || undefined}
+                title={chip.title}
               >
                 <span className="tool-chip-dot" />
                 <span>{entry.tool}</span>
-                <span className="muted">· {label}</span>
+                <span className="muted">· {chip.label}</span>
               </button>
             );
           })}
+        </div>
+      ) : null}
+
+      {result.correlation_id ? (
+        <div className="run-cid">
+          correlation_id: {result.correlation_id}
         </div>
       ) : null}
     </div>
