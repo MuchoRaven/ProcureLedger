@@ -101,14 +101,18 @@ function Root() {
     : (nav[0]?.id ?? '');
   const label = nav.find((item) => item.id === activeId)?.label ?? activeId;
 
+  // The dark control-plane chrome covers the whole operator console, not just
+  // Overview: every operator view shares the slate work surface, while the
+  // executor and agent consoles keep the original light shell. Only the
+  // surfaces change - each view keeps its own layout.
+  const dark = session.role === 'operator';
+
   return (
     <Layout
       nav={nav}
       active={activeId}
       onNavigate={setActive}
-      // The dark control-plane chrome is scoped to Overview; every other view
-      // keeps the original light shell.
-      variant={activeId === 'overview' ? 'dark' : 'default'}
+      variant={dark ? 'dark' : 'default'}
     >
       <View id={activeId} label={label} onNavigate={setActive} />
     </Layout>
