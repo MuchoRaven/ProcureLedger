@@ -430,7 +430,7 @@ def require_any(
     return _authenticate(authorization)
 
 
-def require_operator_or_executor(
+def verify_operator_or_executor_token(
     authorization: Optional[str] = Header(default=None, alias="Authorization"),
 ) -> tools.Principal:
     """Allow the operator or executor credential, but not the agent.
@@ -1236,7 +1236,7 @@ def verify_audit(
 @app.get("/invoices")
 def invoice_index(
     cid: str = Depends(correlation_id_header),
-    principal: tools.Principal = Depends(require_operator_or_executor),
+    principal: tools.Principal = Depends(verify_operator_or_executor_token),
 ) -> Any:
     """List every invoice. Operator/executor only; the model cannot reach this."""
     return _respond(list_invoices(), cid)
@@ -1246,7 +1246,7 @@ def invoice_index(
 def get_invoice(
     invoice_id: str,
     cid: str = Depends(correlation_id_header),
-    principal: tools.Principal = Depends(require_operator_or_executor),
+    principal: tools.Principal = Depends(verify_operator_or_executor_token),
 ) -> Any:
     return _respond(_tools_ap.get_invoice(invoice_id), cid)
 
