@@ -961,13 +961,20 @@ button {
 /* Login                                                              */
 /* ------------------------------------------------------------------ */
 
+/*
+ * The login screen renders outside the shell, so the dark console theme in
+ * ``styles-dark.css`` never reaches it. The background is set here to the
+ * same slate-950 the operator console uses, so the door matches the room.
+ * The card stays light: ``index.html`` declares ``color-scheme: light``, and
+ * a dark card would need every input restyled to match.
+ */
 .login {
   display: flex;
   align-items: center;
   justify-content: center;
   min-height: 100vh;
   padding: 24px;
-  background: var(--bg);
+  background: #0f172a;
 }
 
 .login-card {
@@ -980,7 +987,10 @@ button {
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
   background: var(--surface);
-  box-shadow: var(--shadow-lg);
+  /* ``--shadow-lg`` is rgba(16, 24, 40, 0.18), which is invisible against
+   * #0f172a. A deeper, larger shadow is what lifts the card off the dark
+   * background. */
+  box-shadow: 0 24px 64px rgba(2, 6, 23, 0.6);
 }
 
 /* ------------------------------------------------------------------ */
