@@ -269,6 +269,22 @@ button {
   color: var(--sidebar-text-dim);
 }
 
+/*
+ * The sign-out button sits on the dark navy sidebar, so the base
+ * ``.btn-ghost`` (light border, dark text) is nearly invisible there. These
+ * rules give the light shell the same treatment the operator's
+ * ``.sidebar-dark`` already applies, so all three consoles match. The
+ * operator's rule has higher specificity and wins with identical values.
+ */
+.sidebar-foot .btn-ghost {
+  border-color: #334155;
+  color: #cbd5e1;
+}
+
+.sidebar-foot .btn-ghost:hover:not(:disabled) {
+  background: rgba(148, 163, 184, 0.1);
+}
+
 .main {
   display: flex;
   flex-direction: column;
@@ -974,52 +990,232 @@ button {
 .chat {
   display: flex;
   flex-direction: column;
-  gap: 16px;
+  gap: 18px;
+  width: 100%;
+  max-width: 920px;
+  margin: 0 auto;
 }
 
 .chat-log {
   display: flex;
   flex-direction: column;
-  gap: 20px;
+  gap: 22px;
 }
 
 .turn {
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: 12px;
+  animation: turn-in 220ms ease-out;
 }
+
+@keyframes turn-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* Bubbles ---------------------------------------------------------- */
 
 .bubble {
   display: flex;
-  flex-direction: column;
-  gap: 6px;
+  gap: 10px;
+  align-items: flex-start;
 }
 
 .bubble-user {
-  align-self: flex-end;
-  max-width: 78%;
-  padding: 10px 14px;
-  border: 1px solid #c6dafb;
-  border-radius: var(--radius-lg);
-  background: var(--accent-soft);
+  flex-direction: row-reverse;
 }
 
-.bubble-agent {
-  align-self: stretch;
+.bubble-avatar {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  color: #fff;
+  user-select: none;
+}
+
+.bubble-avatar-user {
+  background: linear-gradient(135deg, #2f6feb, #1d4ed8);
+}
+
+.bubble-avatar-agent {
+  background: linear-gradient(135deg, #7c3aed, #2f6feb);
+  box-shadow: 0 0 0 3px rgba(124, 58, 237, 0.12);
+}
+
+.bubble-content {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+  max-width: 78%;
+}
+
+.bubble-user .bubble-content {
+  align-items: flex-end;
+}
+
+.bubble-agent .bubble-content {
+  flex: 1;
+  max-width: 100%;
 }
 
 .bubble-role {
   font-size: 11px;
   font-weight: 600;
   text-transform: uppercase;
-  letter-spacing: 0.04em;
+  letter-spacing: 0.05em;
   color: var(--text-muted);
 }
 
 .bubble-body {
+  padding: 10px 14px;
+  border-radius: 14px;
+  font-size: 13.5px;
+  line-height: 1.5;
   white-space: pre-wrap;
   word-break: break-word;
 }
+
+.bubble-user .bubble-body {
+  background: linear-gradient(135deg, #2f6feb, #1d4ed8);
+  color: #fff;
+  border-bottom-right-radius: 4px;
+}
+
+.bubble-agent .bubble-body {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-bottom-left-radius: 4px;
+  box-shadow: var(--shadow);
+}
+
+.bubble-agent .bubble-body.muted {
+  color: var(--text-muted);
+  font-style: italic;
+}
+
+/* Typing indicator ------------------------------------------------ */
+
+.typing {
+  display: inline-flex;
+  gap: 4px;
+  align-items: center;
+}
+
+.typing span {
+  width: 6px;
+  height: 6px;
+  border-radius: 999px;
+  background: var(--text-muted);
+  animation: typing-bounce 1.2s infinite ease-in-out;
+}
+
+.typing span:nth-child(2) {
+  animation-delay: 0.15s;
+}
+
+.typing span:nth-child(3) {
+  animation-delay: 0.3s;
+}
+
+@keyframes typing-bounce {
+  0%,
+  60%,
+  100% {
+    transform: translateY(0);
+    opacity: 0.4;
+  }
+  30% {
+    transform: translateY(-4px);
+    opacity: 1;
+  }
+}
+
+/* Tool call chips ------------------------------------------------- */
+
+.tool-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 2px;
+}
+
+.tool-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface);
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 11.5px;
+  cursor: pointer;
+  transition: border-color 120ms ease, background 120ms ease;
+}
+
+.tool-chip:hover {
+  border-color: var(--border-strong);
+  background: var(--surface-2);
+}
+
+.tool-chip-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 999px;
+  flex: 0 0 auto;
+}
+
+.tool-chip-ok .tool-chip-dot {
+  background: var(--ok);
+}
+
+.tool-chip-error .tool-chip-dot {
+  background: var(--danger);
+}
+
+.tool-chip-warn .tool-chip-dot {
+  background: var(--warn);
+}
+
+.tool-chip-warn {
+  border-color: #f0d9ae;
+  background: var(--warn-soft);
+}
+
+/* Run meta -------------------------------------------------------- */
+
+.run-meta {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 11.5px;
+  color: var(--text-muted);
+}
+
+.run-meta-dot {
+  width: 3px;
+  height: 3px;
+  border-radius: 999px;
+  background: var(--text-muted);
+}
+
+/* Composer -------------------------------------------------------- */
 
 .composer {
   display: flex;
@@ -1027,27 +1223,32 @@ button {
   gap: 8px;
   padding: 12px 14px;
   border: 1px solid var(--border);
-  border-radius: var(--radius-lg);
+  border-radius: 14px;
   background: var(--surface);
   box-shadow: var(--shadow);
+  transition: border-color 120ms ease, box-shadow 120ms ease;
+}
+
+.composer:focus-within {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px rgba(47, 111, 235, 0.12);
 }
 
 .composer textarea {
   width: 100%;
-  padding: 8px 10px;
-  border: 1px solid var(--border-strong);
-  border-radius: var(--radius);
-  background: var(--surface);
+  padding: 4px 2px;
+  border: 0;
+  background: transparent;
   color: var(--text);
   font: inherit;
-  font-size: 13px;
-  resize: vertical;
+  font-size: 13.5px;
+  line-height: 1.5;
+  resize: none;
+  outline: none;
 }
 
-.composer textarea:focus {
-  outline: 2px solid var(--accent);
-  outline-offset: -1px;
-  border-color: var(--accent);
+.composer textarea::placeholder {
+  color: var(--text-muted);
 }
 
 .composer-actions {
@@ -1055,6 +1256,99 @@ button {
   align-items: center;
   justify-content: space-between;
   gap: 12px;
+}
+
+.composer-hint {
+  font-size: 11.5px;
+  color: var(--text-muted);
+}
+
+.composer-send {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  padding: 0;
+  border: 0;
+  border-radius: 999px;
+  background: var(--accent);
+  color: #fff;
+  cursor: pointer;
+  transition: background 120ms ease, transform 120ms ease;
+}
+
+.composer-send:hover:not(:disabled) {
+  background: #2560d4;
+  transform: translateY(-1px);
+}
+
+.composer-send:disabled {
+  background: var(--surface-3);
+  color: var(--text-muted);
+  cursor: not-allowed;
+}
+
+/* Empty state ----------------------------------------------------- */
+
+.chat-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 14px;
+  padding: 48px 24px;
+  text-align: center;
+}
+
+.chat-empty-avatar {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 56px;
+  height: 56px;
+  border-radius: 999px;
+  background: linear-gradient(135deg, #7c3aed, #2f6feb);
+  color: #fff;
+  font-size: 20px;
+  font-weight: 700;
+  box-shadow: 0 8px 24px rgba(47, 111, 235, 0.25);
+}
+
+.chat-empty-title {
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.chat-empty-sub {
+  max-width: 420px;
+  font-size: 13px;
+  color: var(--text-muted);
+}
+
+.chat-suggestions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 8px;
+  margin-top: 6px;
+}
+
+.chat-suggestion {
+  padding: 7px 12px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface);
+  color: var(--text);
+  font-size: 12.5px;
+  cursor: pointer;
+  transition: border-color 120ms ease, background 120ms ease, color 120ms ease;
+}
+
+.chat-suggestion:hover {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--accent);
 }
 
 /*
@@ -1118,7 +1412,7 @@ pre {
     margin-bottom: 8px;
   }
 
-  .bubble-user {
+  .bubble-content {
     max-width: 100%;
   }
 }

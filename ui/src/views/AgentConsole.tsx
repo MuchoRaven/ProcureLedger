@@ -3,7 +3,7 @@ import { ApiError } from '../api/client';
 import { useApi } from '../api/hooks';
 import type { AgentResult, AgentTranscriptEntry } from '../api/types';
 import { Drawer } from '../components/Drawer';
-import { Empty, ErrorBanner } from '../components/Feedback';
+import { ErrorBanner } from '../components/Feedback';
 
 /**
  * The agent console.
@@ -38,6 +38,19 @@ type Turn = {
   result: AgentResult | null;
   error: Error | null;
 };
+
+/**
+ * Example prompts. Each one is a real, valid call against the seed data:
+ * INV-2002 is RECEIVED and matches PO-1002, SKU-HYD-001 has three live
+ * quotes, INV-2004 is in EXCEPTION with a past due date, and VEND-004 is
+ * HIGH risk.
+ */
+const SUGGESTIONS = [
+  'Run a three-way match on INV-2002 against PO-1002.',
+  'Compare vendors for SKU-HYD-001.',
+  'What is the aging bucket for INV-2004?',
+  'Look up vendor VEND-004 and its risk tier.',
+];
 
 /**
  * Recover a completed run from the error ``call()`` threw.
@@ -86,22 +99,22 @@ export function AgentConsole() {
   } | null>(null);
   const nextId = useRef(1);
 
-  async function send() {
-    const text = draft.trim();
-    if (!text || running) return;
+  async function send(text: string) {
+    const trimmed = text.trim();
+    if (!trimmed || running) return;
 
     const id = nextId.current++;
     setDraft('');
     setRunning(true);
     setTurns((prev) => [
       ...prev,
-      { id, message: text, pending: true, result: null, error: null },
+      { id, message: trimmed, pending: true, result: null, error: null },
     ]);
 
     try {
       const result = await request<AgentResult>('/agent/run', {
         method: 'POST',
-        body: { message: text },
+        body: { message: trimmed },
       });
       setTurns((prev) =>
         prev.map((turn) =>
@@ -129,13 +142,13 @@ export function AgentConsole() {
 
   function submit(event: FormEvent) {
     event.preventDefault();
-    void send();
+    void send(draft);
   }
 
   function onKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
     if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') {
       event.preventDefault();
-      void send();
+      void send(draft);
     }
   }
 
@@ -163,10 +176,27 @@ export function AgentConsole() {
       </div>
 
       {turns.length === 0 ? (
-        <Empty>
-          No runs yet. Ask the agent to inspect a vendor, run a three-way match,
-          or open a payout approval.
-        </Empty>
+        <div className="chat-empty">
+          <div className="chat-empty-avatar">PL</div>
+          <div className="chat-empty-title">Ask ProcureLedger</div>
+          <div className="chat-empty-sub">
+            Inspect vendors, run three-way matches, or open a payout approval.
+            The agent cannot move money - settlement is a separate executor
+            action.
+          </div>
+          <div className="chat-suggestions">
+            {SUGGESTIONS.map((s) => (
+              <button
+                key={s}
+                type="button"
+                className="chat-suggestion"
+                onClick={() => void send(s)}
+              >
+                {s}
+              </button>
+            ))}
+          </div>
+        </div>
       ) : (
         <div className="chat-log">
           {turns.map((turn) => (
@@ -184,18 +214,32 @@ export function AgentConsole() {
           value={draft}
           onChange={(event) => setDraft(event.target.value)}
           onKeyDown={onKeyDown}
-          placeholder="e.g. Run a three-way match on INV-2001 against PO-1001."
-          rows={3}
+          placeholder="Ask the agent to inspect a vendor, run a three-way match, or open a payout approval…"
+          rows={2}
           spellCheck={false}
         />
         <div className="composer-actions">
-          <span className="muted small">Ctrl/⌘ + Enter to send</span>
+          <span className="composer-hint">Ctrl/⌘ + Enter to send</span>
           <button
             type="submit"
-            className="btn btn-primary"
+            className="composer-send"
             disabled={running || !draft.trim()}
+            aria-label="Send"
           >
-            {running ? 'Running…' : 'Send'}
+            <svg
+              width="16"
+              height="16"
+              viewBox="0 0 16 16"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="1.8"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              aria-hidden="true"
+            >
+              <path d="M2.5 8h11" />
+              <path d="m9 3.5 4.5 4.5L9 12.5" />
+            </svg>
           </button>
         </div>
       </form>
@@ -243,19 +287,47 @@ function TurnCard({
   return (
     <div className="turn">
       <div className="bubble bubble-user">
-        <div className="bubble-role">You</div>
-        <div className="bubble-body">{turn.message}</div>
+        <div className="bubble-avatar bubble-avatar-user" aria-hidden="true">
+          <svg
+            width="14"
+            height="14"
+            viewBox="0 0 16 16"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="1.6"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          >
+            <circle cx="8" cy="5.5" r="2.5" />
+            <path d="M3 13.5c0-2.5 2.2-4 5-4s5 1.5 5 4" />
+          </svg>
+        </div>
+        <div className="bubble-content">
+          <div className="bubble-role">You</div>
+          <div className="bubble-body">{turn.message}</div>
+        </div>
       </div>
 
       <div className="bubble bubble-agent">
-        <div className="bubble-role">Agent</div>
-        {turn.pending ? (
-          <div className="bubble-body muted">Running…</div>
-        ) : turn.error ? (
-          <ErrorBanner error={turn.error} />
-        ) : turn.result ? (
-          <RunResult result={turn.result} onSelect={onSelect} />
-        ) : null}
+        <div className="bubble-avatar bubble-avatar-agent" aria-hidden="true">
+          PL
+        </div>
+        <div className="bubble-content">
+          <div className="bubble-role">Agent</div>
+          {turn.pending ? (
+            <div className="bubble-body muted">
+              <span className="typing">
+                <span />
+                <span />
+                <span />
+              </span>
+            </div>
+          ) : turn.error ? (
+            <ErrorBanner error={turn.error} />
+          ) : turn.result ? (
+            <RunResult result={turn.result} onSelect={onSelect} />
+          ) : null}
+        </div>
       </div>
     </div>
   );
@@ -298,62 +370,38 @@ function RunResult({
         </div>
       )}
 
-      <div className="muted small">
-        {result.steps} step{result.steps === 1 ? '' : 's'} · {calls} tool call
-        {calls === 1 ? '' : 's'}
+      <div className="run-meta">
+        <span>
+          {result.steps} step{result.steps === 1 ? '' : 's'}
+        </span>
+        <span className="run-meta-dot" />
+        <span>
+          {calls} tool call{calls === 1 ? '' : 's'}
+        </span>
       </div>
 
       {calls > 0 ? (
-        <div className="table-wrap">
-          <table className="table">
-            <thead>
-              <tr>
-                <th className="num">#</th>
-                <th>Tool</th>
-                <th>Result</th>
-                <th>Audit</th>
-                <th className="actions">Actions</th>
-              </tr>
-            </thead>
-            <tbody>
-              {result.transcript.map((entry, index) => {
-                const gap = auditGap(entry.result);
-                return (
-                  <tr key={index}>
-                    <td className="num mono">{index + 1}</td>
-                    <td className="mono">{entry.tool}</td>
-                    <td>
-                      {toolOk(entry.result) ? (
-                        <span className="chip chip-ok">ok</span>
-                      ) : (
-                        <span className="chip chip-danger">
-                          {toolError(entry.result) || 'error'}
-                        </span>
-                      )}
-                    </td>
-                    <td>
-                      {gap ? (
-                        <span className="chip chip-warn" title={gap}>
-                          audit gap
-                        </span>
-                      ) : (
-                        <span className="muted">—</span>
-                      )}
-                    </td>
-                    <td className="actions">
-                      <button
-                        type="button"
-                        className="btn btn-sm btn-ghost"
-                        onClick={() => onSelect(entry, index + 1)}
-                      >
-                        View
-                      </button>
-                    </td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
+        <div className="tool-chips">
+          {result.transcript.map((entry, index) => {
+            const gap = auditGap(entry.result);
+            const ok = toolOk(entry.result);
+            const err = toolError(entry.result);
+            const tone = gap ? 'warn' : ok ? 'ok' : 'error';
+            const label = gap ? 'audit gap' : ok ? 'ok' : err || 'error';
+            return (
+              <button
+                key={index}
+                type="button"
+                className={`tool-chip tool-chip-${tone}`}
+                onClick={() => onSelect(entry, index + 1)}
+                title={gap || err || undefined}
+              >
+                <span className="tool-chip-dot" />
+                <span>{entry.tool}</span>
+                <span className="muted">· {label}</span>
+              </button>
+            );
+          })}
         </div>
       ) : null}
     </div>
