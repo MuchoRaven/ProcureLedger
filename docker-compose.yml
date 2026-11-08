@@ -1,0 +1,27 @@
+services:
+  procureledger:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    privileged: true
+    environment:
+      PL_AGENT_TOKEN: ${PL_AGENT_TOKEN}
+      PL_OPERATOR_TOKEN: ${PL_OPERATOR_TOKEN}
+      PL_EXECUTOR_TOKEN: ${PL_EXECUTOR_TOKEN}
+      PL_OPERATOR_NAME: ${PL_OPERATOR_NAME:-alice}
+      PL_EXECUTOR_NAME: ${PL_EXECUTOR_NAME:-bob}
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      OPENAI_API_BASE: ${OPENAI_API_BASE:-https://api.vultrinference.com/v1}
+      VULTR_MODEL: ${VULTR_MODEL:-deepseek-v4.1-flash-1017}
+      AUDIT_LOG_PATH: /data/audit_log.jsonl
+      PL_AUDIT_MIN_FREE_MB: "64"
+      PL_AUDIT_RECOVERY: fail
+      PL_FOLLOWUP_INTERVAL_S: "300"
+    volumes:
+      - procureledger_data:/data
+    ports:
+      - "80"
+
+volumes:
+  procureledger_data:
