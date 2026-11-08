@@ -68,8 +68,6 @@ Status mapping:
 * ``tools.ToolError`` -> ``_TOOL_ERROR_STATUS``, default 400.
 * Tool results that come back ``ok: false`` -> the same mapping, so
   ``GET /invoices/INV-NOPE`` is a 404 rather than a 200 carrying an error.
-* Sandbox failures (``SANDBOX_*``) -> 503. The host is broken, not the
-  caller, and retrying will not help until it is fixed.
 * Agent client/model init failures -> 503.
 * Agent step-cap exhaustion -> 200 with ``ok: false``; the run completed.
 * Anything unhandled -> 500 ``INTERNAL_ERROR``, still in the envelope.
@@ -104,12 +102,6 @@ The lifespan hook takes an exclusive ``fcntl.flock`` on
 ``<AUDIT_LOG_PATH>.lock`` *first*, then runs ``sandbox.preflight`` and
 ``preflight_auth``. The lock comes first so a second worker fails before it
 pays for the sandbox smoke test.
-
-``sandbox.preflight`` runs one real ``bwrap`` invocation, not just a
-``shutil.which`` check, so a host that has the binaries but cannot actually
-sandbox fails here rather than on the first tool call. That is the difference
-between a boot failure that names the cause and a stream of
-``SANDBOX_VIOLATION`` results that look like a broken tool.
 
 The lock is the only thing pinning the process to one worker, and it has to
 be: ``tools._LOCK`` and the audit chain are process-local, so a second worker
@@ -611,17 +603,6 @@ _TOOL_ERROR_STATUS = {
     # error for a server-side outage.
     "AUDIT_LOG_UNWRITABLE": 503,
     "AUDIT_WRITE_FAILED": 503,
-    # Sandbox failures are deployment failures, not caller errors. They are
-    # mapped explicitly so a broken host reads as a 503 rather than the
-    # default 400: the caller did nothing wrong, and retrying will not help
-    # until the host is fixed. ``sandbox._classify_stderr`` picks the specific
-    # code; ``SANDBOX_VIOLATION`` is the fallback when nothing matched.
-    "SANDBOX_VIOLATION": 503,
-    "SANDBOX_NO_USERNS": 503,
-    "SANDBOX_NO_PYTHON": 503,
-    "SANDBOX_OOM": 503,
-    "SANDBOX_TIMEOUT": 503,
-    "SANDBOX_SPAWN_FAILED": 503,
     "INVOICE_NOT_FOUND": 404,
     "APPROVAL_NOT_FOUND": 404,
     "VENDOR_NOT_FOUND": 404,
